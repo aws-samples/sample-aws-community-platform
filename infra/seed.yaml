@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Community Portal — Install-time seeding (D7). Custom-resource Lambdas seed the
+  scoring framework, email templates and certification catalog; create the
+  bootstrap Administrator as a Cognito user (US-1.27) with a discarded random
+  password, reached via "Forgot password"; deploy SPA assets + inject config.json.
+
+Parameters:
+  Stage: { Type: String, Default: dev }
+  SpaBucketName: { Type: String }
+  ApiEndpoint: { Type: String }
+  UserPoolId: { Type: String }
+  UserPoolClientId: { Type: String }
+  AdminEmail: { Type: String }
+  IdentityAccessTableName: { Type: String, Description: "Identity & Access single table — the seeder writes the bootstrap Administrator's portal record directly (role=Administrator), mirroring bulk import (US-1.31) rather than relying on JIT (which defaults to Member)." }
+  ContributionsTableName: { Type: String, Default: '', Description: "Contributions & Scoring main table — the seeder writes the default scoring framework (activities, event points, tiers) so auto-award works day one (Unit 7 DL16). Idempotent: existing rows are never overwritten." }
+  DistributionId: { Type: String, Default: '' }
+  # Changes each deploy so the seed / SPA-deploy custom resources re-run (they
+  # only fire when their properties change, not when Lambda code changes).
+  DeployNonce: { Type: String, Default: '0' }
+  # Managed policy from foundation granting DynamoDB-mediated use of the table
+  # CMK. Required (no Default): the seeder's GetItem fails with a KMS
+  # AccessDenied without it.
+  DynamoDbKmsAccessPolicyArn: { Type: String }
+
+Globals:
+  Function: { Runtime: python3.12, Timeout: 120, MemorySize: 256 }
+
+Conditions:
+  # Only wire the contributions-scoring seed (env var + IAM) when a real table
+  # name was passed. Guards standalone deploys where the param is left empty.
+  HasContributionsTable: !Not [!Equals [!Ref ContributionsTableName, '']]
+
+Resources:
+  # NOTE: there is deliberately NO Secrets Manager secret for the bootstrap
+  # Administrator's password. The seeder generates one, sets it PERMANENT, and
+  # discards it; the operator arrives via "Forgot password" (US-1.20/1.27),
+  # exactly like every admin-created and bulk-imported user (US-1.31).
+  #
+  # The secret it replaced (community-portal/bootstrap-admin-<stage>) was there
+  # for operator retrieval, but went stale the moment anyone used the reset link,
+  # leaving an unrotated admin password on record that no longer worked. It was
+  # never a security boundary either — reading it made you admin, and anyone able
+  # to deploy this stack can already call admin-set-user-password.
+  #
+  # Do NOT "fix" this by letting Cognito generate a TEMPORARY password instead:
+  # that lands the account in FORCE_CHANGE_PASSWORD, where Cognito refuses
+  # ForgotPassword outright and the SPA has no NEW_PASSWORD_REQUIRED challenge
+  # to complete. Permanent-password-then-reset is the only combination that
+  # works. See platform/seed/seed_handler.py.
+  SeederFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "One-shot CloudFormation custom resource — runs only during stack operations, VPC placement not required"
+          - id: W92
+            reason: "One-shot CloudFormation custom resource — concurrency limit not applicable"
+    Properties:
+      FunctionName: !Sub "community-portal-seeder-${Stage}"
+      Handler: seed_handler.handler
+      CodeUri: ../platform/seed/
+      Environment:
+        Variables:
+          ADMIN_EMAIL: !Ref AdminEmail
+          USER_POOL_ID: !Ref UserPoolId
+          IDENTITY_ACCESS_TABLE: !Ref IdentityAccessTableName
+          # Empty when no contributions table is wired (standalone deploy);
+          # _seed_contributions_framework then logs a no-op.
+          CONTRIBUTIONS_TABLE: !Ref ContributionsTableName
+      Policies:
+        # DynamoDB CMK use. This seeder reads and writes the identity-access and
+        # contributions tables directly, so it needs the key like any service
+        # Lambda. It was MISSED in the first pass because the audit enumerated the
+        # 8 -app templates only, and the deploy failed here with
+        # "community-portal-seeder-dev is not authorized to perform: kms:Decrypt".
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminGetUser
+                - cognito-idp:AdminSetUserPassword
+                - cognito-idp:AdminDeleteUser
+                - cognito-idp:AdminAddUserToGroup
+              Resource: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolId}"
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IdentityAccessTableName}"
+            # Scoring-framework seed (Unit 7 DL16). Only present when a real
+            # contributions table name was passed (see HasContributionsTable).
+            - !If
+              - HasContributionsTable
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ContributionsTableName}"
+              - !Ref AWS::NoValue
+
+  SeedResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SeederFunction.Arn
+      AdminEmail: !Ref AdminEmail   # re-run when the admin identity changes
+      Nonce: !Ref DeployNonce
+
+  SpaDeployerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "One-shot CloudFormation custom resource — runs only during stack operations, VPC placement not required"
+          - id: W92
+            reason: "One-shot CloudFormation custom resource — concurrency limit not applicable"
+    Properties:
+      FunctionName: !Sub "community-portal-spa-deployer-${Stage}"
+      Handler: spa_deploy_handler.handler
+      CodeUri: ../platform/seed/
+      Policies:
+        - S3CrudPolicy: { BucketName: !Ref SpaBucketName }
+        - Statement:
+            - Effect: Allow
+              Action: cloudfront:CreateInvalidation
+              Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${DistributionId}"
+      Environment:
+        Variables:
+          SPA_BUCKET: !Ref SpaBucketName
+          API_ENDPOINT: !Ref ApiEndpoint
+          USER_POOL_ID: !Ref UserPoolId
+          USER_POOL_CLIENT_ID: !Ref UserPoolClientId
+          DISTRIBUTION_ID: !Ref DistributionId
+
+  SpaDeployResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SpaDeployerFunction.Arn
+      Nonce: !Ref DeployNonce   # re-upload the SPA on every deploy

@@ -1,0 +1,560 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  App stack for contributions-scoring (Unit 7). FIVE purpose-separated functions
+  (NFR Q1=A) sharing one code package + SQS (+DLQ) + EventBridge rules + nightly
+  Scheduler + per-function least-privilege IAM + alarms.
+Parameters:
+  Stage: { Type: String, Default: dev }
+  RestApiId: { Type: String }
+  # The private twin of RestApiId. Same route table, reachable only from
+  # inside the VPC through the execute-api interface endpoint.
+  PrivateRestApiId: { Type: String }
+  RootResourceId: { Type: String }
+  EventBusName: { Type: String }
+  TableName: { Type: String }
+  StreamArn: { Type: String }
+  IdempotencyTableName: { Type: String }
+  OpsAlarmTopicArn: { Type: String }
+  ApiBaseUrl:
+    Type: String
+    Description: >
+      API Gateway base URL — used by the HTTP handler to call Identity's
+      /groups/my-memberships endpoint and refresh stale JWT member_group_ids
+      mid-session (same pattern as forums and certifications services).
+  PrivateSubnetIds: { Type: CommaDelimitedList }
+  LambdaSecurityGroupId: { Type: String }
+  # CMK from the foundation stack for the log group(s) below. Required (no
+  # Default): an empty string is not a valid KmsKeyId, so a missing value must
+  # fail at deploy time rather than silently produce an unencrypted log group.
+  LogsKmsKeyArn: { Type: String }
+  # Managed policy from foundation granting DynamoDB-mediated use of the table
+  # CMK. Required (no Default): without it every DynamoDB call from these
+  # functions fails with a KMS AccessDenied once the key policy's wildcard
+  # statement is removed.
+  DynamoDbKmsAccessPolicyArn: { Type: String }
+  # SQS CMK + its use policy from the Keys stack. Required (no Default):
+  # an empty KmsMasterKeyId is not valid, and a queue silently falling back
+  # to no encryption is exactly what this change exists to prevent.
+  SqsKmsKeyArn: { Type: String }
+  SqsKmsAccessPolicyArn: { Type: String }
+  UserExportBucketName: { Type: String, Default: '', Description: "Shared bucket for generated CSV exports (Foundation output). This service writes under the contributions/ prefix. Empty disables the export worker." }
+  UserExportBucketArn: { Type: String, Default: '', Description: "ARN of the same bucket. Conditions key off the ARN, not the name, because an empty name still yields a valid-looking Sub." }
+
+Conditions:
+  HasExportBucket: !Not [ !Equals [ !Ref UserExportBucketArn, '' ] ]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 30
+    Tracing: Active
+    CodeUri: ../../dist/contributions-scoring.zip
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref TableName
+        IDEMPOTENCY_TABLE: !Ref IdempotencyTableName
+        EVENT_BUS_NAME: !Ref EventBusName
+        STAGE: !Ref Stage
+Resources:
+
+  # ----------------------------------------------------------------- queues
+  #
+  # SSE-KMS with the shared SQS CMK from the Keys stack, NOT SqsManagedSseEnabled.
+  # The two are mutually exclusive — setting KmsMasterKeyId turns SSE-SQS off — so
+  # this is a swap, not an addition. Reason for the move: Checkov CKV_AWS_27 and
+  # cfn_nag W48 both inspect only KmsMasterKeyId and cannot see SSE-SQS, so the
+  # previous (genuinely encrypted) configuration could never satisfy either. See
+  # infra/keys.yaml SqsKmsKey for why a customer key is required rather than
+  # alias/aws/sqs — EventBridge writes AwardQueue and ConsumerQueue and must be
+  # granted in the key policy, which is not editable on an AWS-managed key.
+  #
+  # KmsDataKeyReusePeriodSeconds is the 24h maximum: it bounds KMS request charges
+  # by letting SQS reuse one data key per period instead of calling
+  # GenerateDataKey per message. The security cost is negligible for 14-day-max
+  # event envelopes.
+  #
+  # Source queue and DLQ share ONE key on purpose — AWS requires a consumer to hold
+  # kms:Decrypt for the source queue's key as well as the DLQ's.
+  AwardDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !Ref SqsKmsKeyArn
+      KmsDataKeyReusePeriodSeconds: 86400
+      MessageRetentionPeriod: 1209600
+  AwardQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !Ref SqsKmsKeyArn
+      KmsDataKeyReusePeriodSeconds: 86400
+      VisibilityTimeout: 180   # >= 6x the worker Timeout (Q4)
+      RedrivePolicy: { deadLetterTargetArn: !GetAtt AwardDLQ.Arn, maxReceiveCount: 5 }
+  AwardQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [ !Ref AwardQueue ]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt AwardQueue.Arn
+  ConsumerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !Ref SqsKmsKeyArn
+      KmsDataKeyReusePeriodSeconds: 86400
+      MessageRetentionPeriod: 1209600
+  ConsumerQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !Ref SqsKmsKeyArn
+      KmsDataKeyReusePeriodSeconds: 86400
+      VisibilityTimeout: 180
+      RedrivePolicy: { deadLetterTargetArn: !GetAtt ConsumerDLQ.Arn, maxReceiveCount: 5 }
+  ConsumerQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [ !Ref ConsumerQueue ]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt ConsumerQueue.Arn
+
+  # ----------------------------------------------------------------- functions
+  ApiFn:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "contributions-scoring-${Stage}"
+      Handler: app.api_handler
+      CodeUri: ../../dist/contributions-scoring.zip
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      Environment:
+        Variables:
+          API_BASE_URL: !Ref ApiBaseUrl
+          # Needed on the API function too: it mints the presigned download URL
+          # when a finished export is collected (the worker writes the object).
+          CONTRIBUTIONS_EXPORT_BUCKET: !Ref UserExportBucketName
+          EXPORT_WORKER_FUNCTION: !Sub "contributions-export-${Stage}"
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - !Ref SqsKmsAccessPolicyArn
+        - DynamoDBCrudPolicy: { TableName: !Ref TableName }
+        - Statement: [ { Effect: Allow, Action: events:PutEvents, Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EventBusName}" } ]
+        - !If
+          - HasExportBucket
+          - Statement:
+              # Kicks off the async export. Scoped to the one worker function —
+              # this role must not be able to invoke arbitrary Lambdas.
+              - Sid: InvokeExportWorker
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:contributions-export-${Stage}"
+              # GetObject only, and only under this service's own prefix: the API
+              # signs download URLs, it never writes or deletes an export. A
+              # presigned URL cannot grant more than its signer holds, so this
+              # also bounds what the link can reach. identity-access (users/,
+              # groups/) and member-profiles (members/) share this bucket and
+              # must stay unreadable from here, which a bucket-wide grant would
+              # silently undo.
+              - Sid: SignExportDownloads
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${UserExportBucketArn}/contributions/*"
+          - !Ref AWS::NoValue
+
+  ConsumerFn:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "contributions-consumer-${Stage}"
+      Handler: app.consumer_handler
+      CodeUri: ../../dist/contributions-scoring.zip
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      Timeout: 60
+      ReservedConcurrentExecutions: 10   # bounds a MembershipChanged storm (Q3)
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - !Ref SqsKmsAccessPolicyArn
+        - DynamoDBCrudPolicy: { TableName: !Ref TableName }
+        - DynamoDBCrudPolicy: { TableName: !Ref IdempotencyTableName }
+        - Statement:
+            - { Effect: Allow, Action: events:PutEvents, Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EventBusName}" }
+      Events:
+        FromConsumerQueue:
+          Type: SQS
+          Properties: { Queue: !GetAtt ConsumerQueue.Arn, BatchSize: 10 }
+
+  AwardWorkerFn:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "contributions-award-${Stage}"
+      Handler: app.award_worker_handler
+      CodeUri: ../../dist/contributions-scoring.zip
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      ReservedConcurrentExecutions: 25   # paces DynamoDB; drains 1000 in ~2s (Q3)
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - !Ref SqsKmsAccessPolicyArn
+        - DynamoDBCrudPolicy: { TableName: !Ref TableName }
+        - DynamoDBCrudPolicy: { TableName: !Ref IdempotencyTableName }
+        - Statement: [ { Effect: Allow, Action: events:PutEvents, Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EventBusName}" } ]
+      Events:
+        FromAwardQueue:
+          Type: SQS
+          Properties: { Queue: !GetAtt AwardQueue.Arn, BatchSize: 10 }
+
+  RollupFn:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "contributions-rollup-${Stage}"
+      Handler: app.rollup_handler
+      CodeUri: ../../dist/contributions-scoring.zip
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      Timeout: 60
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - !Ref SqsKmsAccessPolicyArn
+        - DynamoDBCrudPolicy: { TableName: !Ref TableName }
+        # Stream event source OnFailure destination (ConsumerDLQ) — the execution
+        # role must be allowed to SendMessage to it, else the event source mapping
+        # (RollupFnLedgerStream) fails to create.
+        - SQSSendMessagePolicy: { QueueName: !GetAtt ConsumerDLQ.QueueName }
+      Events:
+        LedgerStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !Ref StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+            MaximumRetryAttempts: 10
+            BisectBatchOnFunctionError: true
+            DestinationConfig: { OnFailure: { Destination: !GetAtt ConsumerDLQ.Arn } }
+
+  SweepFn:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "contributions-sweep-${Stage}"
+      Handler: app.sweep_handler
+      CodeUri: ../../dist/contributions-scoring.zip
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      MemorySize: 1024   # batch aggregate over the quarter's rollups
+      Timeout: 300
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - !Ref SqsKmsAccessPolicyArn
+        - DynamoDBCrudPolicy: { TableName: !Ref TableName }
+      # NO Schedule event (2026-08-27). This function is now invoked only by the
+      # scheduled-jobs state machine (settings-scheduled-jobs-${Stage}), which runs
+      # every job once, in order. Its own cron(0 2) rule would have meant a second
+      # nightly run at a different hour for no benefit.
+
+  # ----------------------------------------------------------------- CSV export worker
+  # Builds the Point Ledger CSV asynchronously: pages the group ledger through the
+  # same read path the on-screen table uses, writes one object to the shared export
+  # bucket, and reports progress on the job record the API polls. Its own function
+  # (same zip, different handler) so a multi-minute export never occupies an
+  # interactive API container — the arrangement identity-access already uses.
+  ExportFn:
+    Type: AWS::Serverless::Function
+    Condition: HasExportBucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "contributions-export-${Stage}"
+      Handler: export_worker.handler
+      CodeUri: ../../dist/contributions-scoring.zip
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      # 512 MB (above the 256 MB global): the CSV is assembled in memory before a
+      # single PutObject, and the extra CPU share that comes with the memory bump
+      # also speeds up per-row formatting.
+      MemorySize: 512
+      # 900 s. Unlike the API path there is no 29 s gateway ceiling here; that
+      # ceiling is the whole reason this function exists.
+      Timeout: 900
+      Environment:
+        Variables:
+          CONTRIBUTIONS_EXPORT_BUCKET: !Ref UserExportBucketName
+      # No retries. The handler catches its own failures, marks the job failed and
+      # releases the per-actor lock, so a Lambda-level retry would re-run an export
+      # the leader has already been told failed — and could flip that job back to
+      # ready or run concurrently with a manual retry.
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - !Ref SqsKmsAccessPolicyArn
+        - Statement:
+            # Query on the table + indexes to page the ledger (GSI3) and read the
+            # member projection; Update to report progress; Delete to release the
+            # export lock. No Scan.
+            - Sid: ExportJobStateAndLedgerRead
+              Effect: Allow
+              Action: [ dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:BatchGetItem ]
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/*"
+            # PutObject only, under this service's own prefix — the worker writes
+            # the export and never reads or deletes one. Deletion is the bucket's
+            # lifecycle rule.
+            - Sid: WriteExportObject
+              Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${UserExportBucketArn}/contributions/*"
+
+  # Surfaces a worker that is failing outright. The job record already carries a
+  # user-visible failure, but a persistent fault (bad IAM, bucket missing) needs
+  # ops attention rather than every leader discovering it one export at a time.
+  ExportErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasExportBucket
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [ { Name: FunctionName, Value: !Ref ExportFn } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+  # --------------------------------------------------- EventBridge rules
+  # Award events (Events, per-earner) -> AwardQueue -> AwardWorker (bounded 25).
+  AwardEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref EventBusName
+      Description: Route Events' per-earner award events to the award queue.
+      EventPattern:
+        detail-type:
+          - AttendanceRecorded
+          - EventDelivered
+          - EventOrganized
+      Targets:
+        - Arn: !GetAtt AwardQueue.Arn
+          Id: contributions-award
+  # Other domain events -> ConsumerQueue -> ConsumerFn (bounded 10).
+  DomainEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref EventBusName
+      Description: Route forum/cert/identity domain events to the consumer queue.
+      EventPattern:
+        detail-type:
+          - ForumPostCreated          # Forums (dormant until Forums is real)
+          - ReplyAccepted             # Forums (dormant)
+          - CertificationApproved     # Certifications
+          - MemberJoinedGroup         # Identity — membership projection + B3
+          - MemberLeftGroup
+          - MemberRemoved
+          # The consumer has always handled these two, but they were missing
+          # here — so the member projection (name/email/role) was never
+          # populated and the group-points Email column came back blank.
+          - UserProvisioned
+          - UserRoleChanged
+          - UserDeactivated
+          - UserReactivated
+          # Member-Profiles — keeps the projected name/photo current so the
+          # leaderboard can show a member's avatar. Identity's UserProvisioned
+          # carries no photo, and the rollup's denormalised copy is only as fresh
+          # as the member's last point event.
+          - MemberProfileUpserted
+      Targets:
+        - Arn: !GetAtt ConsumerQueue.Arn
+          Id: contributions-consumer
+
+  # ----------------------------------------------------------------- API route wiring
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/*"
+  # Second permission, for the PRIVATE API. SourceArn pins a permission to a
+  # single api id, so the public one above does NOT cover requests arriving
+  # through the private API — without this they fail with API Gateway unable to
+  # invoke the function.
+  PrivateApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/*"
+
+  # ----------------------------------------------------------------- alarms
+  AwardDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [ { Name: QueueName, Value: !GetAtt AwardDLQ.QueueName } ]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  ConsumerDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [ { Name: QueueName, Value: !GetAtt ConsumerDLQ.QueueName } ]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  RollupLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: IteratorAge
+      Dimensions: [ { Name: FunctionName, Value: !Ref RollupFn } ]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 600000   # 10 min of rollup lag
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  ApiErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [ { Name: FunctionName, Value: !Ref ApiFn } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+
+  # ── Silent-degradation signals ────────────────────────────────────────────
+  # Every fail-soft path below logs a warning, substitutes a fallback and returns
+  # success, so without these the degradation is invisible: the caller gets a 200
+  # containing quietly wrong data. Added after finding 49 unnoticed membership-
+  # lookup timeouts in forums over four days.
+  #
+  # PLAIN-TEXT filter patterns on purpose. get_logger() attaches the JSON
+  # formatter only to the logger it names (propagate=False), so modules using
+  # logging.getLogger(__name__) emit Lambda's default TEXT format. A JSON
+  # { $.message = ... } pattern matches nothing there; a quoted substring matches
+  # both formats.
+  #
+  # Explicit log group because Lambda only auto-creates it on first invocation,
+  # so a metric filter cannot attach on a fresh install without it. It also
+  # replaces an auto-created group that had NO retention policy at all.
+  FnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/contributions-scoring-${Stage}"
+      RetentionInDays: 30
+      KmsKeyId: !Ref LogsKmsKeyArn
+  AuthzDegradationsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # authorisation computed from stale or default data instead of live state
+      FilterPattern: '?"membership lookup failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/ContributionsScoring
+          MetricName: AuthzDegradations
+          MetricValue: '1'
+  AuthzDegradationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "authorisation computed from stale or default data instead of live state"
+      Namespace: Portal/ContributionsScoring
+      MetricName: AuthzDegradations
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: absent data means no calls were attempted, NOT that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA when idle.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  LostDomainEventsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # a domain event was dropped after its write committed, so downstream projections diverge
+      FilterPattern: '?"event publish failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/ContributionsScoring
+          MetricName: LostDomainEvents
+          MetricValue: '1'
+  LostDomainEventsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "a domain event was dropped after its write committed, so downstream projections diverge"
+      Namespace: Portal/ContributionsScoring
+      MetricName: LostDomainEvents
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: absent data means no calls were attempted, NOT that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA when idle.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+Outputs:
+  FunctionArn: { Value: !GetAtt ApiFn.Arn }

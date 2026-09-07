@@ -1,0 +1,154 @@
+{
+  "title": "EventAwardEvents",
+  "description": "Point-award events published by the Events service and consumed by Contributions & Scoring (Unit 7) for auto-award. Every award carries `idempotencyKey`, derived from identity rather than time, so a consumer retry cannot double-award (BR-P6). `points` MAY be null when Contributions was unreachable at publication time \u2014 the fact of attendance/delivery is still authoritative and the consumer resolves the value from its own framework.",
+  "oneOf": [
+    {
+      "$ref": "#/definitions/AttendanceRecorded"
+    },
+    {
+      "$ref": "#/definitions/EventDelivered"
+    },
+    {
+      "$ref": "#/definitions/EventOrganized"
+    }
+  ],
+  "definitions": {
+    "AttendanceRecorded": {
+      "type": "object",
+      "description": "One per confirmed attendee. Published only when attendance is APPLIED \u2014 a Teams fetch awards nothing (BR-T4). Batched at 10 per PutEvents call, with a 1000-attendee ceiling per apply (N4).",
+      "required": [
+        "idempotencyKey",
+        "eventId",
+        "userId"
+      ],
+      "properties": {
+        "idempotencyKey": {
+          "type": "string",
+          "description": "<eventId>#<userId>#attendance"
+        },
+        "eventId": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string"
+        },
+        "groupId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "eventType": {
+          "type": "string"
+        },
+        "points": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "csv",
+            "teams"
+          ]
+        },
+        "eventDate": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "ISO event date; Contributions uses it for quarter attribution (Unit 7 DL11/US-6.12). Added 2026-08-07."
+        }
+      }
+    },
+    "EventDelivered": {
+      "type": "object",
+      "description": "Delivery points for a presenter, published at completion by either route (manual completion or applied attendance). Emitted ONLY for designees holding the Member role \u2014 leaders may be designated but are not point-eligible (BR-P3, US-6.17).",
+      "required": [
+        "idempotencyKey",
+        "eventId",
+        "userId"
+      ],
+      "properties": {
+        "idempotencyKey": {
+          "type": "string",
+          "description": "<eventId>#<userId>#presenter"
+        },
+        "eventId": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string"
+        },
+        "groupId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "eventType": {
+          "type": "string"
+        },
+        "points": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "eventDate": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "ISO event date; Contributions uses it for quarter attribution (Unit 7 DL11/US-6.12). Added 2026-08-07."
+        }
+      }
+    },
+    "EventOrganized": {
+      "type": "object",
+      "description": "Organize points for an event organizer (US-6.18). Same eligibility rule as EventDelivered.",
+      "required": [
+        "idempotencyKey",
+        "eventId",
+        "userId"
+      ],
+      "properties": {
+        "idempotencyKey": {
+          "type": "string",
+          "description": "<eventId>#<userId>#organizer"
+        },
+        "eventId": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string"
+        },
+        "groupId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "eventType": {
+          "type": "string"
+        },
+        "points": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "eventDate": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "ISO event date; Contributions uses it for quarter attribution (Unit 7 DL11/US-6.12). Added 2026-08-07."
+        }
+      }
+    }
+  }
+}

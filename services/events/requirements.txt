@@ -1,0 +1,13 @@
+# Events service (Unit 4) — pinned runtime dependencies (SECURITY-10).
+#
+# Zero new runtime dependencies beyond what Units 2/3/11 already pin. Everything
+# this unit could have imported a library for is stdlib instead, deliberately:
+#   recurrence expansion  -> datetime + calendar   (not python-dateutil)
+#   .ics rendering        -> hand-written RFC 5545 (not icalendar)
+#   CSV parsing           -> csv                   (NOT openpyxl/xlsx — the
+#                            SheetJS/xlsx path carries unpatched high-severity
+#                            CVEs and was deliberately removed from this repo)
+#   tokens                -> secrets + hashlib + hmac
+#   cross-service reads   -> urllib + ThreadPoolExecutor
+boto3==1.34.162
+aws-lambda-powertools==2.43.1

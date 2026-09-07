@@ -1,0 +1,40 @@
+{
+  "title": "SettingsEvents",
+  "description": "Settings domain events (v1) carried in the platform event envelope 'data' field. Emitted to EventBridge after the primary write commits. Consumers are idempotent on the envelope id. SettingsChanged is published for every successful settings/template/file-share write so consumers (Identity & Access, Notifications, Analytics, frontend) can invalidate caches instead of polling.",
+  "oneOf": [
+    { "$ref": "#/definitions/SettingsChanged" }
+  ],
+  "definitions": {
+    "SettingsChanged": {
+      "type": "object",
+      "required": ["changedBy"],
+      "properties": {
+        "changedBy": { "type": "string", "description": "Actor user id (or 'anonymous', never expected in practice — writes are Administrator/leader-gated)." },
+        "settings": {
+          "type": "object",
+          "description": "Full post-change settings object (present for updateSettings). Consumers should re-read GET /settings or /public/settings rather than relying on this snapshot for authorization decisions.",
+          "properties": {
+            "communityName": { "type": "string" },
+            "logoUrl": { "type": "string" },
+            "defaultTimezone": { "type": "string" },
+            "enableSemanticSearch": { "type": "boolean" },
+            "selfRegistrationEnabled": { "type": "boolean" },
+            "allowedEmailDomains": { "type": "array", "items": { "type": "string" } },
+            "otpIntervalDays": { "type": "integer" },
+            "teamsEnabled": { "type": "boolean" },
+            "teamsTenantId": { "type": "string" },
+            "llmDuplicateDetectionEnabled": { "type": "boolean" },
+            "bedrockModel": { "type": "string" },
+            "whatsNewEnabled": { "type": "boolean" },
+            "whatsNewFeedUrl": { "type": "string" },
+            "senderName": { "type": "string" },
+            "senderEmail": { "type": "string" }
+          }
+        },
+        "emailTemplateId": { "type": "string", "description": "Present when the change was an email-template edit (US-8.5)." },
+        "fileShareLinkCreated": { "type": "string", "description": "Link id, present when a file-share link was created (US-8.13)." },
+        "fileShareLinkRevoked": { "type": "string", "description": "Link id, present when a file-share link was revoked (US-8.13)." }
+      }
+    }
+  }
+}

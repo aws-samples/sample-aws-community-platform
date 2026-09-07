@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "Administrator": [],
+    "CommunityLeader": [
+      { "action": "view", "resource": "scoring-framework", "scope": "global" },
+      { "action": "manage", "resource": "scoring-framework", "scope": "global" },
+      { "action": "view", "resource": "contribution-approvals", "scope": "global" },
+      { "action": "decide", "resource": "contribution-submission", "scope": "global" },
+      { "action": "adjust", "resource": "member-points", "scope": "global" },
+      { "action": "view", "resource": "contribution-summary", "scope": "global" },
+      { "action": "export", "resource": "contribution-summary", "scope": "global" },
+      { "action": "view", "resource": "leaderboard", "scope": "global" },
+      { "action": "view", "resource": "member-ledger", "scope": "global" }
+    ],
+    "UserGroupLeader": [
+      { "action": "view", "resource": "contribution-approvals", "scope": "group" },
+      { "action": "decide", "resource": "contribution-submission", "scope": "group" },
+      { "action": "adjust", "resource": "member-points", "scope": "group" },
+      { "action": "view", "resource": "contribution-summary", "scope": "group" },
+      { "action": "view", "resource": "leaderboard", "scope": "group" },
+      { "action": "view", "resource": "member-ledger", "scope": "group" }
+    ],
+    "Member": [
+      { "action": "submit", "resource": "contribution", "scope": "own" },
+      { "action": "view", "resource": "own-submissions", "scope": "own" },
+      { "action": "withdraw", "resource": "own-submission", "scope": "own" },
+      { "action": "view", "resource": "own-points", "scope": "own" },
+      { "action": "view", "resource": "leaderboard", "scope": "own" }
+    ]
+  }
+}

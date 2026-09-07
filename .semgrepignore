@@ -1,0 +1,38 @@
+# Semgrep ignore rules
+# See: https://semgrep.dev/docs/ignoring-files-folders-code/
+
+# jsx-not-internationalized: No near-term localization plans for this project.
+# All UI strings are intentionally in English only. Suppressing across all frontend files.
+frontend/src/
+
+# load-testing: Developer-only tooling run locally against a test environment.
+# subprocess.run uses a fully-qualified list (no shell=True, no user-controlled input).
+load-testing/
+
+# platform/build: Internal CI build tooling. subprocess.run calls use list form
+# with sys.executable and pathlib.Path values — no shell interpolation.
+platform/build/
+
+# infra/tools: Operator deployment utilities run locally or in CI, not
+# exposed to external input. URLs and paths come from CloudFormation outputs.
+# regex_dos in stage_events_gsis.py: pattern matches fixed CloudFormation
+# resource ID format, not user-supplied input.
+infra/tools/
+
+# services/identity-access/tests: Test fixtures with hardcoded passwords are
+# intentional test utilities. Passwords never reach production.
+# services/forums/src and services/contributions-scoring/src *_client.py:
+# urllib dynamic-url findings are suppressed via .bandit; these internal
+# service clients call env-var-configured VPC endpoints, not user-supplied URLs.
+# Tracked separately for urllib scheme validation fix.
+services/identity-access/tests/conftest.py
+
+# .cfn_nag_suppress.yaml: cfn_nag suppression list — not a Semgrep rule file.
+# Semgrep incorrectly parses it as a Semgrep YAML rule and reports missing
+# metadata/language/message fields. The file has no Semgrep rules.
+.cfn_nag_suppress.yaml
+
+# platform/seed/cfn.py: CloudFormation custom resource response helper.
+# The ResponseURL is a pre-signed S3 URL injected by CloudFormation itself —
+# not user-supplied input. Already annotated with # noqa: S310 inline.
+platform/seed/cfn.py

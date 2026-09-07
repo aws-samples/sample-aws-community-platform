@@ -1,0 +1,25 @@
+{
+  "title": "MemberProfilesEvents",
+  "description": "Member Profiles domain events (v1) carried in the platform event envelope 'data' field. Emitted to EventBridge after the primary write commits (BR-7). Consumers (Search, Unit 13) are idempotent on the envelope id.",
+  "oneOf": [
+    { "$ref": "#/definitions/MemberProfileUpserted" }
+  ],
+  "definitions": {
+    "MemberProfileUpserted": {
+      "type": "object",
+      "required": ["userId"],
+      "properties": {
+        "userId": { "type": "string" },
+        "firstName": { "type": "string" },
+        "lastName": { "type": "string" },
+        "email": { "type": "string" },
+        "skills": { "type": "array", "items": { "type": "string" } },
+        "bio": { "type": "string" },
+        "city": { "type": "string" },
+        "country": { "type": "string" },
+        "professionalRole": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "inactive"] }
+      }
+    }
+  }
+}

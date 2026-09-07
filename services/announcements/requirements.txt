@@ -1,0 +1,9 @@
+# Announcements service (Unit 9) — pinned runtime dependencies (SECURITY-10; vendored at package time).
+#
+# ZERO new runtime dependencies beyond the shared base. The announcement body is
+# stored as inert Markdown (no server-side HTML sanitizer) — rendering + sanitization
+# happen at the client boundary (markdown-it html:false + DOMPurify, NFR-AN-SEC-1/2).
+# This deliberately avoids a native dependency (nh3), keeping the Lambda package
+# pure-Python and side-stepping cross-platform wheel packaging.
+boto3==1.34.162
+aws-lambda-powertools==2.43.1

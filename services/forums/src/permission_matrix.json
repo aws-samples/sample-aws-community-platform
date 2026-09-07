@@ -1,0 +1,62 @@
+{
+  "permissions": {
+    "CommunityLeader": [
+      {"action": "browse", "resource": "forums", "scope": "global"},
+      {"action": "create", "resource": "forum", "scope": "global"},
+      {"action": "edit", "resource": "forum", "scope": "global"},
+      {"action": "delete", "resource": "forum", "scope": "global"},
+      {"action": "create", "resource": "channel", "scope": "global"},
+      {"action": "edit", "resource": "channel", "scope": "global"},
+      {"action": "delete", "resource": "channel", "scope": "global"},
+      {"action": "create", "resource": "post", "scope": "global"},
+      {"action": "edit", "resource": "post", "scope": "own"},
+      {"action": "delete", "resource": "post", "scope": "global"},
+      {"action": "create", "resource": "reply", "scope": "global"},
+      {"action": "edit", "resource": "reply", "scope": "own"},
+      {"action": "delete", "resource": "reply", "scope": "global"},
+      {"action": "react", "resource": "content", "scope": "global"},
+      {"action": "pin", "resource": "post", "scope": "global"},
+      {"action": "accept", "resource": "reply", "scope": "global"},
+      {"action": "follow", "resource": "content", "scope": "global"},
+      {"action": "report", "resource": "content", "scope": "global"},
+      {"action": "moderate", "resource": "reports", "scope": "global"},
+      {"action": "search", "resource": "forums", "scope": "global"},
+      {"action": "mention", "resource": "users", "scope": "global"}
+    ],
+    "UserGroupLeader": [
+      {"action": "browse", "resource": "forums", "scope": "group"},
+      {"action": "create", "resource": "channel", "scope": "group"},
+      {"action": "edit", "resource": "channel", "scope": "group"},
+      {"action": "delete", "resource": "channel", "scope": "group"},
+      {"action": "create", "resource": "post", "scope": "group"},
+      {"action": "edit", "resource": "post", "scope": "own"},
+      {"action": "delete", "resource": "post", "scope": "group"},
+      {"action": "create", "resource": "reply", "scope": "group"},
+      {"action": "edit", "resource": "reply", "scope": "own"},
+      {"action": "delete", "resource": "reply", "scope": "group"},
+      {"action": "react", "resource": "content", "scope": "group"},
+      {"action": "pin", "resource": "post", "scope": "group"},
+      {"action": "accept", "resource": "reply", "scope": "group"},
+      {"action": "follow", "resource": "content", "scope": "group"},
+      {"action": "report", "resource": "content", "scope": "group"},
+      {"action": "moderate", "resource": "reports", "scope": "group"},
+      {"action": "search", "resource": "forums", "scope": "group"},
+      {"action": "mention", "resource": "users", "scope": "group"}
+    ],
+    "Member": [
+      {"action": "browse", "resource": "forums", "scope": "group"},
+      {"action": "create", "resource": "post", "scope": "group"},
+      {"action": "edit", "resource": "post", "scope": "own"},
+      {"action": "delete", "resource": "post", "scope": "own"},
+      {"action": "create", "resource": "reply", "scope": "group"},
+      {"action": "edit", "resource": "reply", "scope": "own"},
+      {"action": "delete", "resource": "reply", "scope": "own"},
+      {"action": "react", "resource": "content", "scope": "group"},
+      {"action": "follow", "resource": "content", "scope": "group"},
+      {"action": "report", "resource": "content", "scope": "group"},
+      {"action": "search", "resource": "forums", "scope": "group"},
+      {"action": "mention", "resource": "users", "scope": "group"}
+    ],
+    "Administrator": []
+  }
+}

@@ -1,0 +1,542 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: App stack for member-profiles (REAL Lambda + routes + scoped role + event consumer + OpenSearch stream indexer + alarms).
+Parameters:
+  Stage: { Type: String, Default: dev }
+  RestApiId: { Type: String }
+  # The private twin of RestApiId. Same route table, reachable only from
+  # inside the VPC through the execute-api interface endpoint.
+  PrivateRestApiId: { Type: String }
+  RootResourceId: { Type: String }
+  EventBusName: { Type: String }
+  EventBusArn: { Type: String, Default: '' }
+  TableName: { Type: String }
+  TableArn: { Type: String }
+  StreamArn: { Type: String }
+  IdempotencyTableName: { Type: String }
+  SpaBucketName: { Type: String, Default: '', Description: "SPA/CloudFront bucket; profile pictures are stored under avatars/ and served at /avatars/... (US-3.2)." }
+  ApiBaseUrl: { Type: String, Default: '', Description: "Shared API Gateway invoke URL, used by FanOutClient for same-account cross-service reads." }
+  EnableSemanticSearch: { Type: String, Default: 'false' }
+  OpenSearchEndpoint: { Type: String, Default: '' }
+  OpenSearchCollectionArn: { Type: String, Default: '' }
+  OpsAlarmTopicArn: { Type: String }
+  PrivateSubnetIds: { Type: CommaDelimitedList }
+  LambdaSecurityGroupId: { Type: String }
+  # CMK from the foundation stack for the log group(s) below. Required (no
+  # Default): an empty string is not a valid KmsKeyId, so a missing value must
+  # fail at deploy time rather than silently produce an unencrypted log group.
+  LogsKmsKeyArn: { Type: String }
+  # Managed policy from foundation granting DynamoDB-mediated use of the table
+  # CMK. Required (no Default): without it every DynamoDB call from these
+  # functions fails with a KMS AccessDenied once the key policy's wildcard
+  # statement is removed.
+  DynamoDbKmsAccessPolicyArn: { Type: String }
+  # SQS CMK + its use policy from the Keys stack. Required (no Default):
+  # an empty KmsMasterKeyId is not valid, and a queue silently falling back
+  # to no encryption is exactly what this change exists to prevent.
+  SqsKmsKeyArn: { Type: String }
+  SqsKmsAccessPolicyArn: { Type: String }
+  UserExportBucketName: { Type: String, Default: '', Description: "Shared generated-exports bucket (Foundation output). This service writes only under the members/ prefix; identity-access owns users/. Empty disables the export worker." }
+  UserExportBucketArn: { Type: String, Default: '', Description: "ARN of the same bucket. Conditions key off the ARN, not the name, because an empty name still yields a valid-looking Sub." }
+
+Conditions:
+  HasBusArn: !Not [ !Equals [ !Ref EventBusArn, '' ] ]
+  HasOpenSearch: !Not [ !Equals [ !Ref OpenSearchEndpoint, '' ] ]
+  HasExportBucket: !Not [ !Equals [ !Ref UserExportBucketArn, '' ] ]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 15
+    Tracing: Active
+Resources:
+  Fn:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "member-profiles-${Stage}"
+      Handler: app.handler            # REAL handler (replaces mock_handler.handler)
+      CodeUri: ../../dist/member-profiles.zip
+      # Raised from global 15s: reindex scans all profiles and bulk-indexes to
+      # OpenSearch (similar to identity-access bulk import). All other operations
+      # return in milliseconds — the higher timeout is harmless.
+      Timeout: 300
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      # No ProvisionedConcurrencyConfig — this unit has no interactive/auth-critical
+      # path (NFR-MP-PERF-4); standard on-demand Lambda scaling suffices.
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTableName
+          EVENT_BUS_NAME: !Ref EventBusName
+          API_BASE_URL: !Ref ApiBaseUrl
+          ENABLE_SEMANTIC_SEARCH: !Ref EnableSemanticSearch
+          OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
+          SPA_BUCKET: !Ref SpaBucketName
+          # Needed on the API function too: it mints the presigned download URL
+          # when a finished export is collected (the worker writes the object).
+          MEMBER_EXPORT_BUCKET: !Ref UserExportBucketName
+          EXPORT_WORKER_FUNCTION: !Sub "member-profiles-export-${Stage}"
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - !Ref SqsKmsAccessPolicyArn
+        # Least privilege (SECURITY-06) — explicit scoped statements, no wildcards.
+        # Materially smaller than Identity & Access's role: no Cognito/SES/Secrets.
+        - Statement:
+            - Sid: TableCrud
+              Effect: Allow
+              Action: [ dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan ]
+              Resource: !Ref TableArn
+            - Sid: TableGsiQuery
+              Effect: Allow
+              Action: [ dynamodb:Query ]
+              Resource: !Sub "${TableArn}/index/*"
+            # The Lambda signs browser presigned POST uploads for profile
+            # pictures; the signer needs PutObject on the SPA bucket's avatars/
+            # prefix ONLY (served at /avatars/... via the existing CloudFront,
+            # the same way certification badges use badges/). GetObject is NOT
+            # granted — CloudFront's OAI reads it.
+            - Sid: AvatarUpload
+              Effect: Allow
+              Action: [ s3:PutObject ]
+              Resource: !Sub "arn:aws:s3:::${SpaBucketName}/avatars/*"
+        - DynamoDBCrudPolicy: { TableName: !Ref IdempotencyTableName }
+        - Statement:
+            - Sid: PublishDomainEvents
+              Effect: Allow
+              Action: events:PutEvents
+              Resource: !If [ HasBusArn, !Ref EventBusArn, !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EventBusName}" ]
+            - Sid: FanOutInvoke
+              Effect: Allow
+              Action: execute-api:Invoke
+              Resource:
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/GET/contributions/*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/GET/contributions/*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/GET/events*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/GET/events*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/GET/forums/*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/GET/forums/*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/GET/posts/*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/GET/posts/*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/GET/channels/*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/GET/channels/*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/GET/certifications/*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/GET/certifications/*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/GET/groups*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/GET/groups*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/GET/settings*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/GET/settings*"
+        - !If
+          - HasOpenSearch
+          - Statement:
+              - Sid: OpenSearchAccess
+                Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource: !Ref OpenSearchCollectionArn
+          - !Ref AWS::NoValue
+        - !If
+          - HasExportBucket
+          - Statement:
+              # Kicks off the async export. Scoped to the one worker function —
+              # this role must not be able to invoke arbitrary Lambdas.
+              - Sid: InvokeExportWorker
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:member-profiles-export-${Stage}"
+              # GetObject only, and only under members/: the API function signs
+              # download URLs, it never writes or deletes an export, and it must
+              # not be able to read identity-access's users/ exports. A presigned
+              # URL cannot grant more than its signer holds, so this also bounds
+              # what the emitted link can do.
+              - Sid: SignExportDownloads
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${UserExportBucketArn}/members/*"
+          - !Ref AWS::NoValue
+  # ----------------------------------------------------------------- Stream indexer Lambda
+  # Indexes MEMBER#*/PROFILE items into OpenSearch whenever a profile is written.
+  MemberIndexerFn:
+    Type: AWS::Serverless::Function
+    Condition: HasOpenSearch
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "member-profiles-indexer-${Stage}"
+      Handler: indexer.handler
+      CodeUri: ../../dist/member-profiles.zip
+      Timeout: 60   # override global 15s — indexer writes to OpenSearch which
+                    # can take up to 30s on cold start; 60s gives headroom
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - !Ref SqsKmsAccessPolicyArn
+        - Statement:
+            - Sid: OpenSearchIndexWrite
+              Effect: Allow
+              Action: aoss:APIAccessAll
+              Resource: !Ref OpenSearchCollectionArn
+        - SQSSendMessagePolicy: { QueueName: !GetAtt MemberIndexerDLQ.QueueName }
+      Events:
+        MemberProfilesStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !Ref StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+            MaximumRetryAttempts: 10
+            BisectBatchOnFunctionError: true
+            DestinationConfig:
+              OnFailure: { Destination: !GetAtt MemberIndexerDLQ.Arn }
+
+  # SSE-KMS with the shared SQS CMK (Keys stack). Swapped from SqsManagedSseEnabled,
+  # which is mutually exclusive with KmsMasterKeyId; both Checkov CKV_AWS_27 and
+  # cfn_nag W48 inspect only the latter. Written by the member indexer's own
+  # event-source mapping (OnFailure destination) under that function's role, so its
+  # grant comes from SqsKmsAccessPolicyArn. See keys.yaml SqsKmsKey.
+  MemberIndexerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !Ref SqsKmsKeyArn
+      KmsDataKeyReusePeriodSeconds: 86400
+      MessageRetentionPeriod: 1209600   # 14 days
+
+  # ----------------------------------------------------------------- CSV export worker Lambda
+  # Builds the Member Directory CSV asynchronously: reads rows from OpenSearch,
+  # writes one object under the export bucket's members/ prefix, and reports
+  # progress on the job record the API polls. Its own function (same zip,
+  # different handler) so a multi-minute export never occupies an interactive API
+  # container — the same arrangement as MemberIndexerFn above.
+  MemberExportFn:
+    Type: AWS::Serverless::Function
+    Condition: HasExportBucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "member-profiles-export-${Stage}"
+      Handler: export_worker.handler
+      CodeUri: ../../dist/member-profiles.zip
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      # 512 MB (above the 256 MB global): the CSV is assembled in memory before a
+      # single PutObject — directory rows are ~120 bytes, so ~3 MB for 25k members
+      # — and the extra CPU share that comes with the memory bump also speeds up
+      # per-row formatting.
+      MemorySize: 512
+      # 900 s, far beyond the ~1 min a 25k-row export takes. Unlike the API path
+      # there is no 29 s gateway ceiling here; that ceiling is why this exists.
+      Timeout: 900
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          MEMBER_EXPORT_BUCKET: !Ref UserExportBucketName
+          OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
+      # No retries. The handler catches its own failures, marks the job failed and
+      # releases the per-leader lock, so a Lambda-level retry would re-run an
+      # export the leader has already been told failed — and could flip that job
+      # back to ready or run concurrently with a manual retry.
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - !Ref SqsKmsAccessPolicyArn
+        - Statement:
+            # One job row: read it, report progress, release the lock. No Scan —
+            # rows come from OpenSearch, never a table scan.
+            - Sid: ExportJobState
+              Effect: Allow
+              Action: [ dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query ]
+              Resource: !Ref TableArn
+            # PutObject only, and only under members/ — the worker writes the
+            # export and never reads or deletes one, and cannot touch
+            # identity-access's users/ exports. Deletion is the lifecycle rule.
+            - Sid: WriteExportObject
+              Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${UserExportBucketArn}/members/*"
+        - !If
+          - HasOpenSearch
+          - Statement:
+              - Sid: OpenSearchRead
+                Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource: !Ref OpenSearchCollectionArn
+          - !Ref AWS::NoValue
+
+  # Surfaces a worker that is failing outright. The job record already carries a
+  # leader-visible failure, but a persistent fault (bad IAM, OpenSearch down)
+  # needs ops attention rather than each leader discovering it one export at a time.
+  MemberExportErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasExportBucket
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [ { Name: FunctionName, Value: !Ref MemberExportFn } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+  # ----------------------------------------------------------------- Alarms
+  MemberIndexerDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [ { Name: QueueName, Value: !GetAtt MemberIndexerDLQ.QueueName } ]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+  MemberIndexerLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasOpenSearch
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: IteratorAge
+      Dimensions: [ { Name: FunctionName, Value: !Ref MemberIndexerFn } ]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 300000   # 5 minutes
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+  # ----------------------------------------------------------------- Event consumption
+  # Subscribes to Identity & Access's 7 published events so the profile-extension
+  # record stays current (BR-9/NFR-MP-REL-3).
+  IdentityEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "member-profiles-identity-events-${Stage}"
+      EventBusName: !Ref EventBusName
+      EventPattern:
+        source: [ identity-access ]
+        detail-type:
+          - UserProvisioned
+          - UserRoleChanged
+          - UserDeactivated
+          - UserReactivated
+          - MemberJoinedGroup
+          - MemberLeftGroup
+          - MemberRemoved
+      State: ENABLED
+      Targets:
+        - Id: member-profiles-event-consumer
+          Arn: !GetAtt Fn.Arn
+  IdentityEventInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IdentityEventRule.Arn
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [ { Name: FunctionName, Value: !Ref Fn } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  P95LatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions: [ { Name: FunctionName, Value: !Ref Fn } ]
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  ThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [ { Name: FunctionName, Value: !Ref Fn } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  # Explicit function log group: Lambda only auto-creates it on first invocation,
+  # so the metric filter below fails on a FRESH install without this resource.
+  FnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/member-profiles-${Stage}"
+      RetentionInDays: 30
+      KmsKeyId: !Ref LogsKmsKeyArn
+  # Fan-out failure rate (this unit's defining resiliency signal — NFR-MP-SEC-6).
+  FanOutFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    # Reference the in-stack log group via !Ref (not a literal name string) so
+    # early-validation ResourceExistenceCheck does not fail on a FRESH install
+    # where the log group does not yet exist at the pre-creation validation phase.
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      FilterPattern: '{ $.message = "fan-out call failed*" }'
+      MetricTransformations:
+        - MetricNamespace: Portal/MemberProfiles
+          MetricName: FanOutFailures
+          MetricValue: '1'
+  FanOutFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: Portal/MemberProfiles
+      MetricName: FanOutFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/*"
+  # Second permission, for the PRIVATE API. SourceArn pins a permission to a
+  # single api id, so the public one above does NOT cover requests arriving
+  # through the private API — without this they fail with API Gateway unable to
+  # invoke the function.
+  PrivateApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/*"
+
+  # ── Silent-degradation signals ────────────────────────────────────────────
+  # Every fail-soft path below logs a warning, substitutes a fallback and returns
+  # success, so without these the degradation is invisible: the caller gets a 200
+  # containing quietly wrong data. Added after finding 49 unnoticed membership-
+  # lookup timeouts in forums over four days.
+  #
+  # PLAIN-TEXT filter patterns on purpose. get_logger() attaches the JSON
+  # formatter only to the logger it names (propagate=False), so modules using
+  # logging.getLogger(__name__) emit Lambda's default TEXT format. A JSON
+  # { $.message = ... } pattern matches nothing there; a quoted substring matches
+  # both formats.
+  AuthzDegradationsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # authorisation computed from stale or default data instead of live state
+      FilterPattern: '?"settings lookup failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/MemberProfiles
+          MetricName: AuthzDegradations
+          MetricValue: '1'
+  AuthzDegradationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "authorisation computed from stale or default data instead of live state"
+      Namespace: Portal/MemberProfiles
+      MetricName: AuthzDegradations
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: absent data means no calls were attempted, NOT that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA when idle.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  LostDomainEventsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # a domain event was dropped after its write committed, so downstream projections diverge
+      FilterPattern: '?"event publish failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/MemberProfiles
+          MetricName: LostDomainEvents
+          MetricValue: '1'
+  LostDomainEventsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "a domain event was dropped after its write committed, so downstream projections diverge"
+      Namespace: Portal/MemberProfiles
+      MetricName: LostDomainEvents
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: absent data means no calls were attempted, NOT that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA when idle.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  GroupNameLookupFailuresMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # group names fell back to raw group ids in profiles and exports
+      FilterPattern: '?"group name lookup failed" ?"group-name lookup failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/MemberProfiles
+          MetricName: GroupNameLookupFailures
+          MetricValue: '1'
+  GroupNameLookupFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "group names fell back to raw group ids in profiles and exports"
+      Namespace: Portal/MemberProfiles
+      MetricName: GroupNameLookupFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: absent data means no calls were attempted, NOT that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA when idle.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+Outputs:
+  FunctionArn: { Value: !GetAtt Fn.Arn }

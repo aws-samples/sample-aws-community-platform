@@ -1,0 +1,16 @@
+{
+  "title": "DomainEventEnvelope",
+  "description": "Common wrapper for every EventBridge domain event. data is validated by the per-event schema.",
+  "type": "object",
+  "required": ["id", "type", "version", "source", "time", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "type": "string", "format": "uuid", "description": "Unique event id; idempotency key for consumers." },
+    "type": { "type": "string", "description": "Event name, e.g. PointsAwarded." },
+    "version": { "type": "integer", "minimum": 1, "description": "Payload schema version (matches vN files)." },
+    "source": { "type": "string", "description": "Publishing service, e.g. contributions-scoring." },
+    "time": { "type": "string", "format": "date-time", "description": "ISO-8601 UTC event time." },
+    "correlationId": { "type": "string", "description": "Trace id propagated across the workflow." },
+    "data": { "type": "object", "description": "Event-specific payload (per-event schema)." }
+  }
+}

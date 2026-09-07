@@ -1,0 +1,296 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Community Portal - encryption keys that must exist BEFORE the data stacks.
+  Exists solely to break a dependency cycle; see the note below.
+
+# WHY THIS STACK EXISTS
+#
+# The DynamoDB CMK used to live in foundation.yaml. It cannot stay there, because
+# of a cycle introduced when cfn_nag W28 was fixed:
+#
+#   * foundation's TokenClaimsFunction is a Cognito PreTokenGeneration trigger, so
+#     UserPool names it directly (LambdaConfig). It therefore CANNOT move out of
+#     foundation - foundation would have to import an ARN from a stack that
+#     consumes foundation's own outputs. The FileShareBucket comment in
+#     foundation.yaml documents the same trap for S3 notifications.
+#   * That function reads the identity-access table. Removing the table's explicit
+#     name (W28) means foundation must be TOLD the generated name, i.e. take it as
+#     a parameter from IdentityAccessData.
+#   * But IdentityAccessData needs the DynamoDB CMK ARN. While the key lived in
+#     foundation, that made IdentityAccessData depend on foundation, and foundation
+#     depend on IdentityAccessData. CloudFormation cannot resolve that.
+#
+# Hoisting the key into a stack that depends on NOTHING breaks it:
+#
+#   Keys               <- nothing
+#   IdentityAccessData <- Keys                          (CMK ARN)
+#   Foundation         <- Keys + IdentityAccessData      (policy ARN, table name)
+#
+# LogsKmsKey deliberately STAYS in foundation. It has no ordering conflict -- every
+# consumer (api-edge, the -app stacks) deploys after foundation -- so moving it
+# would be churn without benefit. The asymmetry is intentional, not an oversight.
+
+Parameters:
+  Stage: { Type: String, Default: dev, AllowedValues: [dev, prod] }
+
+Resources:
+  # DynamoDB table encryption key (AWS Config DYNAMODB_TABLE_ENCRYPTED_KMS).
+  #
+  # SEPARATE key from LogsKmsKey, deliberately. They have different ViaService
+  # conditions and, more importantly, different blast radii: disabling the logs
+  # key stops log ingestion, while disabling this one makes all 20 TABLES
+  # Inaccessible. Sharing one key would couple those two failures together.
+  #
+  # WHAT THIS DOES AND DOES NOT BUY. The tables were never unencrypted: every one
+  # already set `SSESpecification: { SSEEnabled: true }`, which is the AWS MANAGED
+  # key (alias/aws/dynamodb) — in-account and CloudTrail-audited, just not owned
+  # by us. So this is a managed-key -> customer-key move, not an
+  # unencrypted -> encrypted move. What it adds is ownership: our own rotation
+  # schedule, and the ability to disable the key as a containment lever. What it
+  # does NOT add is finer-grained access control — see the key policy below.
+  #
+  # OPERATIONAL RISK, and it is much larger than the logs key. If this key is
+  # disabled or scheduled for deletion, every table's status becomes
+  # Inaccessible: reads AND writes stop. DynamoDB emails you and waits SEVEN
+  # DAYS; if access is not restored it archives the tables and you restore from a
+  # backup it creates. Do not disable this key to test anything.
+  #
+  # Switching encryption is an in-place UpdateTable (SSEEnabled/SSEType/
+  # KMSMasterKeyId are all No-interruption), so no table is replaced and no data
+  # is moved. That matters here specifically: the W28 note in
+  # .cfn_nag_suppress.yaml records that replacing these named tables previously
+  # destroyed ~380k items.
+  DynamoDbKmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "DynamoDB table encryption — community-portal-${Stage}"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: 'kms:*'
+            Resource: '*'
+          # There is deliberately NO second statement here.
+          #
+          # This key policy previously carried an `AllowUseThroughDynamoDbOnly`
+          # statement with Principal "*", bounded by kms:CallerAccount and
+          # kms:ViaService — the same shape AWS uses for alias/aws/dynamodb. It was
+          # removed on 2026-08-31 because cfn_nag F76 ("KMS key should not allow *
+          # principal") fires on it, and F76 does not evaluate the conditions that
+          # bound it. Suppressing was rejected; the finding is fixed instead.
+          #
+          # Authorisation now works the way the statement above says: that root
+          # principal with kms:* is the standard DelegateToIAMPolicies statement,
+          # which grants nothing by itself and permits IAM policies in this account
+          # to grant. The grant lives in DynamoDbKmsAccessPolicy below, attached to
+          # the 18 Lambda roles that touch an encrypted table.
+          #
+          # This is strictly tighter than the wildcard it replaces: the set of
+          # principals that can use this key is now enumerable, and still bounded
+          # to DynamoDB-mediated requests by the ViaService condition on the
+          # managed policy.
+          #
+          # CONSEQUENCE TO UNDERSTAND BEFORE EDITING: a new Lambda that reads or
+          # writes any of these tables and does NOT carry
+          # DynamoDbKmsAccessPolicyArn will fail EVERY DynamoDB call with a KMS
+          # AccessDenied — not degrade, fail. That is the cost of removing the
+          # blanket account-wide grant, and it is the intended trade.
+      Tags: [{ Key: Project, Value: community-portal }, { Key: Stage, Value: !Ref Stage }]
+  # RENAMED from alias/community-portal-dynamodb-${Stage}, and the rename is
+  # required rather than cosmetic.
+  #
+  # Moving a resource between CloudFormation stacks is not a move: the new stack
+  # CREATES it and the old stack DELETES it, in that order. An alias name is unique
+  # per account/region, so reusing the old name made this stack collide with the
+  # alias foundation still owned. The first attempt failed exactly there:
+  #
+  #   Validation failed with 1 error(s)  (alias already exists)
+  #
+  # Nothing references the alias by name — templates use the key ARN — so renaming
+  # is free. Foundation deletes the old alias during the same deploy.
+  DynamoDbKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/community-portal-ddb-${Stage}"
+      TargetKeyId: !Ref DynamoDbKmsKey
+
+  # Managed policy granting DynamoDB-mediated use of the CMK, attached to every
+  # Lambda role that touches an encrypted table.
+  #
+  # WHY THIS EXISTS: cfn_nag F76 ("KMS key should not allow * principal") fires on
+  # a key policy statement with Principal "*", and it does not evaluate the
+  # conditions that bound such a statement. Rather than suppress it, the wildcard
+  # statement is removed from the key policy and authorisation moves here — which
+  # is genuinely tighter, because the key now names who may use it instead of
+  # saying "anyone in the account, via DynamoDB".
+  #
+  # This works because the key policy's first statement is the standard
+  # root-principal `kms:*` statement, which AWS documents as DelegateToIAMPolicies:
+  # it does not grant anything by itself, it permits IAM policies in this account
+  # to grant. Without a policy like this one attached, no Lambda could decrypt.
+  #
+  # A ManagedPolicy rather than 16 copies of an inline statement: one definition,
+  # one place to audit, and one place to fix. The trade-offs accepted are the ones
+  # inherent to managed policies — it is an account-scoped object with a 6144-char
+  # limit and a 10-per-role cap, and it outlives the roles that reference it.
+  #
+  # ViaService is retained even though the principals are now named. It is defence
+  # in depth: if one of these roles were ever compromised, the grant still cannot
+  # be used to decrypt anything except through DynamoDB.
+  #
+  # CreateGrant is included because AWS lists it among the permissions DynamoDB
+  # requires on a customer managed key — DynamoDB creates a per-table grant for
+  # background maintenance and table-key generation. Omitting it risks a failure
+  # that surfaces late and reads like an unrelated fault; ViaService bounds it.
+  # SQS queue encryption key (Checkov CKV_AWS_27 / cfn_nag W48).
+  #
+  # WHAT THIS CHANGES. The queues were never unencrypted: all 8 already set
+  # `SqsManagedSseEnabled: true`, which is SSE-SQS — real server-side encryption
+  # with a key SQS owns. Neither scanner can see it: both inspect only
+  # KmsMasterKeyId, so SSE-SQS can never satisfy either. This is therefore an
+  # SSE-SQS -> SSE-KMS move, not an unencrypted -> encrypted move.
+  #
+  # WHY A CUSTOMER KEY AND NOT alias/aws/sqs. The AWS-managed SQS key would also
+  # satisfy the scanners, and would be cheaper. It does not work here: FOUR of the
+  # 8 queues are written by EventBridge — AwardQueue and ConsumerQueue as rule
+  # targets, and the announcements/forums ConsumerDLQs as rule DeadLetterConfig
+  # destinations. EventBridge must be granted kms:GenerateDataKey/kms:Decrypt in
+  # the KEY POLICY, and the AWS-managed key's policy cannot be edited. Using it
+  # would silently break event delivery — and for the two DLQ cases the thing that
+  # breaks IS the failure path, so the loss would be invisible.
+  #
+  # SEPARATE key from DynamoDbKmsKey, for the same reason that one is separate
+  # from LogsKmsKey: different ViaService conditions and different blast radii.
+  # Disabling this key stops event ingestion; disabling the DynamoDB key makes
+  # every table Inaccessible. Sharing one key would couple those failures.
+  #
+  # ROTATION is automatic and needs no operator action: KMS rotates the key
+  # MATERIAL annually while the key id, ARN and alias stay the same, and it retains
+  # previous material so anything already encrypted stays readable. Nothing in this
+  # repo references key material, so there is nothing to update on rotation. For
+  # SQS it is doubly moot — messages expire in at most 14 days.
+  SqsKmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "SQS queue encryption — community-portal-${Stage}"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Standard DelegateToIAMPolicies statement: grants nothing by itself,
+          # permits IAM policies in this account to grant. Same as DynamoDbKmsKey.
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: 'kms:*'
+            Resource: '*'
+          # EventBridge CANNOT be granted through an IAM policy the way the Lambda
+          # roles below are — it is an AWS service principal, not a role in this
+          # account, so its permission has to live in the key policy. This is the
+          # statement AWS documents for "AWS service event sources" sending to an
+          # encrypted queue.
+          #
+          # This does NOT trip cfn_nag F76 (the finding fixed on DynamoDbKmsKey):
+          # F76 fires on `Principal: "*"`. This names one service principal.
+          #
+          # aws:SourceAccount rather than aws:SourceArn: AWS prefers SourceArn, but
+          # the 8 queue ARNs live in 5 -app stacks that deploy AFTER this one, so
+          # naming them here would be exactly the dependency cycle this stack was
+          # created to avoid. SourceAccount is AWS's documented fallback for when
+          # the resource ARN is not known, and it still blocks the confused-deputy
+          # case by refusing any other account's EventBridge.
+          #
+          # NO kms:ViaService condition here, deliberately. EventBridge calls KMS
+          # directly when delivering to the queue, not through SQS, so a
+          # ViaService: sqs.* condition would deny the very call this statement
+          # exists to allow.
+          - Sid: AllowEventBridgeToEncryptForSqs
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action:
+              - 'kms:GenerateDataKey*'
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Tags: [{ Key: Project, Value: community-portal }, { Key: Stage, Value: !Ref Stage }]
+
+  SqsKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/community-portal-sqs-${Stage}"
+      TargetKeyId: !Ref SqsKmsKey
+
+  # Use of the SQS CMK by the Lambda roles that produce to or consume from an
+  # encrypted queue. Same shape and rationale as DynamoDbKmsAccessPolicy: the key
+  # policy names no principals beyond the root delegation, so without this policy
+  # attached a role cannot send or receive.
+  #
+  # BOTH actions, for both directions. A CONSUMER needs kms:Decrypt when the data
+  # key reuse period expires on its next ReceiveMessage. A PRODUCER needs
+  # kms:Decrypt as well as kms:GenerateDataKey — SQS re-verifies the new data key's
+  # integrity on the next SendMessage, so GenerateDataKey alone is not enough. That
+  # asymmetry is easy to miss and fails at runtime, not at deploy.
+  #
+  # One key for source queues AND their DLQs, deliberately: AWS requires a consumer
+  # to hold kms:Decrypt for the key of the SOURCE queue as well as the DLQ's own,
+  # so two keys would mean two grants and a new way to get it wrong.
+  SqsKmsAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Use of the SQS CMK, restricted to requests made through SQS.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: UseSqsCmkThroughSqs
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - 'kms:GenerateDataKey*'
+              - kms:DescribeKey
+            Resource: !GetAtt SqsKmsKey.Arn
+            Condition:
+              StringLike: { 'kms:ViaService': 'sqs.*.amazonaws.com' }
+
+  DynamoDbKmsAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      # ManagedPolicyName is deliberately NOT set. An explicit name triggers
+      # cfn_nag W28, and nothing needs a predictable name here: consumers take
+      # the ARN as a parameter, and Ref returns the generated ARN.
+      Description: Use of the DynamoDB CMK, restricted to requests made through DynamoDB.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: UseDynamoDbCmkThroughDynamoDb
+            Effect: Allow
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: !GetAtt DynamoDbKmsKey.Arn
+            Condition:
+              StringLike: { 'kms:ViaService': 'dynamodb.*.amazonaws.com' }
+
+Outputs:
+  # Consumed by the 8 -data stacks for SSESpecification.KMSMasterKeyId.
+  DynamoDbKmsKeyArn: { Value: !GetAtt DynamoDbKmsKey.Arn }
+  # Attached to every Lambda role that touches an encrypted table: the 8 -app
+  # stacks, seed.yaml, and foundation's own TokenClaimsFunction.
+  DynamoDbKmsAccessPolicyArn: { Value: !Ref DynamoDbKmsAccessPolicy }
+  # Consumed by the 5 -app stacks that declare queues, for
+  # AWS::SQS::Queue.KmsMasterKeyId.
+  SqsKmsKeyArn: { Value: !GetAtt SqsKmsKey.Arn }
+  # Attached to the Lambda roles that produce to or consume from those queues.
+  SqsKmsAccessPolicyArn: { Value: !Ref SqsKmsAccessPolicy }

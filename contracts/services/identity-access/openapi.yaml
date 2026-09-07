@@ -1,0 +1,334 @@
+openapi: 3.0.3
+info: { title: Identity & Access API, version: 1.0.0 }
+paths:
+  /auth/login:
+    post:
+      operationId: login
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [email, password], properties: { email: { type: string }, password: { type: string } } } } } }
+      responses: { '200': { description: Session or OTP challenge, content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /auth/otp:
+    post:
+      operationId: verifyOtp
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [code, challengeId], properties: { code: { type: string }, challengeId: { type: string, description: 'Returned by /auth/login when otpRequired is true. Documented 2026-08-11 — the service and the SPA both always used it, the schema just never declared it.' } } } } } }
+      responses: { '200': { description: Session, content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /auth/register:
+    post:
+      operationId: selfRegister
+      x-mock-collection: users
+      # Returns an acknowledgement, not the created User (BR-A6) — the default
+      # POST heuristic would make the mock echo a User and diverge from this contract.
+      x-mock-kind: ack
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [email, firstName, lastName], properties: { email: { type: string }, firstName: { type: string }, lastName: { type: string }, password: { type: string, deprecated: true, description: 'IGNORED since 2026-08-11 (BR-P8). Accounts are created with a system-generated password that is never disclosed; the user sets their own via Forgot password, and reading that emailed code is what proves mailbox control. Tolerated for one release so a cached older SPA bundle does not break; will be removed.' } } } } } }
+      responses: { '201': { description: 'Acknowledgement. Deliberately identical whether the address was newly registered or already had an account, so the endpoint cannot be used to discover who holds an account (BR-A6) — it therefore returns a message, not the created User.', content: { application/json: { schema: { type: object, required: [message], properties: { message: { type: string } } } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /groups:
+    get:
+      operationId: listGroups
+      description: >-
+        Group directory (US-1.16). Members/UGLs get the unpaged list (card grid, incl. per-caller myState).
+        Community Leaders pass includeDeleted=true (soft-deleted grace rows, US-1.11) and — for the high-volume
+        "All Groups" management table — limit/cursor for server-side pagination (per-row member-count + leader
+        resolution bounded to page size). Paged mode omits myState. Bare GET /groups is unchanged.
+      parameters:
+        - { name: includeDeleted, in: query, schema: { type: boolean }, description: "CL-only — include soft-deleted groups still in their grace period." }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 }, description: "Page size — enables paged mode." }
+        - { name: cursor, in: query, schema: { type: string }, description: "Opaque cursor from the previous page." }
+      responses: { '200': { description: Groups, content: { application/json: { schema: { $ref: '#/components/schemas/GroupList' } } } }, '400': { description: Invalid cursor or limit, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '501': { $ref: '#/components/responses/NI' } }
+    post:
+      operationId: createGroup
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/GroupInput' } } } }
+      responses: { '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Group' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /groups/{id}:
+    get:
+      operationId: getGroup
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Group, content: { application/json: { schema: { $ref: '#/components/schemas/Group' } } } }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+    put:
+      operationId: editGroup
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/GroupInput' } } } }
+      responses: { '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Group' } } } }, '501': { $ref: '#/components/responses/NI' } }
+    delete:
+      operationId: deleteGroup
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: Soft-deleted }, '501': { $ref: '#/components/responses/NI' } }
+  /groups/{id}/join:
+    post:
+      operationId: joinGroup
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Joined or requested }, '501': { $ref: '#/components/responses/NI' } }
+  /groups/{id}/join/withdraw:
+    post:
+      operationId: withdrawJoinRequest
+      description: Member withdraws their OWN pending join request (US-1.8/1.21 addendum, user-requested 2026-08-04) — allowed only while Pending; the request leaves the leader queue with status Withdrawn and the member may re-request later.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Withdrawn, content: { application/json: { schema: { $ref: '#/components/schemas/JoinRequest' } } } }, '404': { description: No pending request, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /groups/{id}/leave:
+    post:
+      operationId: leaveGroup
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Left }, '501': { $ref: '#/components/responses/NI' } }
+  /groups/{id}/requests:
+    get:
+      operationId: listJoinRequests
+      x-mock-collection: joinRequests
+      description: >-
+        Pending join requests for a group (US-1.21), oldest first. Optional cursor
+        pagination (2026-08-05): each row costs a profile read to resolve the requester's
+        display name, so the page bounds the work rather than the pending backlog.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 } }
+        - { name: cursor, in: query, schema: { type: string }, description: "Opaque cursor from the previous page." }
+      responses: { '200': { description: Requests, content: { application/json: { schema: { $ref: '#/components/schemas/JoinRequestList' } } } }, '400': { description: Invalid cursor or limit, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /groups/{id}/restore:
+    post:
+      operationId: restoreGroup
+      description: Undo Delete (US-1.11) — restores a soft-deleted group within its 2-week grace period. Community Leader only. Memberships are not auto-restored; former members are notified they may rejoin (GroupRestored event).
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Restored, content: { application/json: { schema: { $ref: '#/components/schemas/Group' } } } }, '400': { description: Group is not soft-deleted, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { description: Not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /join-requests:
+    get:
+      operationId: listAllJoinRequests
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 }, description: "Page size — enables paged mode (2026-08-08, high volume)." }
+        - { name: cursor, in: query, schema: { type: string }, description: "Opaque cursor from the previous page." }
+      description: Community Leader cross-group queue (US-1.21) — pending join requests across all approval-required groups, oldest first, with groupName resolved.
+      responses: { '200': { description: Pending requests, content: { application/json: { schema: { $ref: '#/components/schemas/JoinRequestList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /groups/{id}/requests/{requestId}:
+    post:
+      operationId: decideJoinRequest
+      description: Approve or reject a pending join request (US-1.21). UGL for their led group; CL for any group. Reject requires a reason. Join date is set at the moment of approval (BR-G5).
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }, { name: requestId, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [decision], properties: { decision: { type: string, enum: [approve, reject] }, reason: { type: string, description: Required when decision is reject. } } } } } }
+      responses: { '200': { description: Decided, content: { application/json: { schema: { $ref: '#/components/schemas/JoinRequest' } } } }, '400': { description: Missing reject reason, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { description: Request not found or already decided, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /users:
+    get:
+      operationId: listUsers
+      description: Admin user list (US-1.5/1.6, US-3.8). Optional server-side filters + cursor pagination (2026-08-03, 13k+ scale) — omitting limit/cursor returns the full listing (CSV export path).
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: "Keyword match on name/email/professionalRole." }
+        - { name: role, in: query, schema: { type: string, enum: [Administrator, CommunityLeader, UserGroupLeader, Member] } }
+        - { name: status, in: query, schema: { type: string, enum: [Active, Inactive] } }
+        - { name: groupId, in: query, schema: { type: string }, description: "Users belonging to (or leading) the group." }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 } }
+        - { name: cursor, in: query, schema: { type: string }, description: "Opaque cursor from the previous page." }
+      responses: { '200': { description: Users, content: { application/json: { schema: { $ref: '#/components/schemas/UserList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+    post:
+      operationId: createUser
+      x-mock-collection: users
+      description: Admin single Add User form (US-1.35). Same identity model as a bulk-import row (US-1.31) — Cognito-owned credentials (generated permanent password, never disclosed), welcome email directs the user to "Forgot password". The Administrator selects the role on the form; it defaults to Member when omitted (BR-R1). Subsequent role changes happen via Edit User (US-1.26). Administrator only.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [email, firstName, lastName], properties: { email: { type: string }, firstName: { type: string }, lastName: { type: string }, role: { type: string, enum: [Administrator, CommunityLeader, UserGroupLeader, Member], default: Member, description: Optional; defaults to Member. }, city: { type: string }, country: { type: string }, professionalRole: { type: string }, awsProject: { type: boolean }, timeZone: { type: string } } } } } }
+      responses: { '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }, '400': { description: Invalid input or duplicate email, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /users/{id}:
+    put:
+      operationId: editUser
+      description: Edit User (US-1.26) — role, group membership, and profile fields in one action. Identity fields (name, email) are read-only (Cognito-owned).
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { role: { type: string }, groupIds: { type: array, items: { type: string } }, city: { type: string }, country: { type: string }, professionalRole: { type: string }, awsProject: { type: boolean }, timeZone: { type: string } } } } } }
+      responses: { '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /users/{id}/disable:
+    post:
+      operationId: disableUser
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Disabled }, '501': { $ref: '#/components/responses/NI' } }
+  /auth/refresh:
+    post:
+      operationId: refreshSession
+      description: 'Exchanges a refresh token for a NEW ID token carrying current claims (additive 2026-08-27). Cognito re-runs the pre-token-generation trigger on REFRESH_TOKEN_AUTH, so role/led_group_id/member_group_ids are re-resolved from the database — this is what lets a group join take effect without signing out. Public like the other /auth routes: the refresh token IS the credential, and the ID token being replaced may be the stale one. A 401 means the refresh token is expired or revoked; callers should keep their existing token rather than sign the user out, since a failed refresh is not a failed session.'
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [refreshToken], properties: { refreshToken: { type: string } } } } } }
+      responses: { '200': { description: New ID token, content: { application/json: { schema: { type: object, required: [token], properties: { token: { type: string } } } } } }, '401': { description: Refresh token expired or revoked, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /auth/reset:
+    post:
+      operationId: resetPassword
+      description: Step 1 (US-1.20) — requests a Cognito-emailed verification code. Always returns a generic message (no user enumeration).
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [email], properties: { email: { type: string } } } } } }
+      responses: { '200': { description: Reset code sent (generic response) }, '501': { $ref: '#/components/responses/NI' } }
+  /auth/reset/confirm:
+    post:
+      operationId: confirmResetPassword
+      description: Step 2 (US-1.20) — submits the emailed code and a new password to complete the Cognito hosted forgot-password flow.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [email, code, newPassword], properties: { email: { type: string }, code: { type: string }, newPassword: { type: string } } } } } }
+      responses: { '200': { description: Password reset }, '400': { description: Invalid code or password, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /users/{id}/enable:
+    post:
+      operationId: enableUser
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Enabled }, '501': { $ref: '#/components/responses/NI' } }
+  /groups/stats/members:
+    get:
+      operationId: membersByGroup
+      x-mock-collection: groups
+      description: >-
+        Member count per user group as of the END of a quarter, plus the members who belong to
+        NO group (US-7.1). Community Leaders only.
+        READS A NIGHTLY SNAPSHOT (2026-08-27), one GetItem — it is not computed on request.
+        It used to be: each call folded every group's membership history and read every user
+        record, which exceeded API Gateway's 29s ceiling on a 12.5k-member community. The
+        `group-member-stats` job now does that work and this returns what it wrote, so
+        `computedAt` tells the caller how fresh the figures are. A quarter the job has not yet
+        computed returns empty items with null roster figures rather than falling back to a live
+        fold, which would restore the timeout on exactly the quarters with the most history.
+        Each group's figure is still folded from the append-only membership history, the same
+        basis as /groups/{id}/growth and the UGL's own "Group Members" card, so a CL and that
+        group's leader never see different numbers; leaders are not counted, since leading a
+        group is not membership (US-1.16).
+        `noGroup` is a real distinct count, NOT `totalMembers - inAnyGroup`: a subtraction cannot
+        go below zero and would quietly absorb the two ways the bars can fail to add up, which
+        `overlap` and `offRoster` report instead. The roster is a current-basis population and
+        cannot be reconstructed for a past quarter, so the roster-derived fields are null unless
+        the selected quarter is the current one.
+        NOTE: this path is declared BEFORE /groups/{id}/members and must stay that way — routes
+        match in order, and "stats" would otherwise bind as {id}.
+      parameters:
+        - { name: quarter, in: query, schema: { type: string }, description: 'Defaults to the current quarter.' }
+      responses: { '200': { description: Members per group, content: { application/json: { schema: { $ref: '#/components/schemas/MembersByGroup' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /groups/{id}/members:
+    get:
+      operationId: listGroupMembers
+      x-mock-collection: users
+      description: >-
+        Group member list (US-1.16). Returns members UNION leaders — leadership is not membership
+        (a UGL leads without a join event), but the group member screen lists leaders alongside
+        members with `roleInGroup` distinguishing them. Optional server-side search + cursor
+        pagination (2026-08-05, 13k+ scale, mirrors /users and /members); omitting limit/cursor/q
+        returns the full listing, kept for small groups and pre-existing callers — the CSV export
+        no longer uses it and is now the async job at /groups/{id}/members/export. Ordering is
+        server-owned: leaders first, then members by id — client-side column sort is disabled in
+        paged mode.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: q, in: query, schema: { type: string }, description: "Keyword match on name/email/professionalRole." }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 } }
+        - { name: cursor, in: query, schema: { type: string }, description: "Opaque cursor from the previous page." }
+      responses: { '200': { description: Members, content: { application/json: { schema: { $ref: '#/components/schemas/UserList' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /groups/{id}/members/export:
+    post:
+      operationId: startGroupMemberExport
+      description: >-
+        Start an async CSV export of one group's roster (UGL > My Group > Export). Replaces a
+        client-side export that walked the member cursor page by page in the browser: correct, but
+        it gave no progress, could not be left unattended, and a 13k-member group meant ~65
+        sequential requests with the tab pinned open. Returns 202 with a job id; the worker builds
+        the file into S3 and the client polls the status path below.
+        Permitted to whoever may VIEW the group directory — Community Leaders and User Group
+        Leaders. Administrators hold no user-group-directory permission and are refused here
+        exactly as they are on the listing itself.
+        Rows come from the AUTHORITATIVE DynamoDB roster, not the search index. `joinedAt` lives on
+        the membership projection and is not indexed at all, so an index-sourced export could not
+        reproduce this file's columns; it also means the CSV cannot omit a member whose indexing is
+        lagging. Columns match the previous export exactly, including `roleInGroup` and `joinedAt`.
+        Cleanup is lifecycle-only: a presigned GET is a direct browser-to-S3 transfer this service
+        never observes completing, so delete-on-download is not implementable. The object expires
+        on the bucket's 1-day rule and the short URL TTL bounds reachability meanwhile.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody: { required: false, content: { application/json: { schema: { type: object, properties: { q: { type: string, description: 'Optional keyword filter, so the CSV matches the filtered roster on screen. When set, `total` is null and the client shows an indeterminate bar: the projection keeps no counter for a filtered subset and counting one would walk the very rows the export is about to walk.' } } } } } }
+      responses: { '202': { description: Export accepted and queued, content: { application/json: { schema: { $ref: '#/components/schemas/GroupMemberExportJob' } } } }, '400': { description: 'An export is already running for this user', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+  /groups/{id}/members/export/{jobId}:
+    get:
+      operationId: getGroupMemberExport
+      description: >-
+        Poll a roster export for progress, and collect the download link once ready. The job must
+        belong to the CALLER and to the group in the path; the group check is not redundant, since
+        without it a leader could read any of their own jobs through any group's URL and the route
+        would stop meaning what it says. A mismatch is reported as 404 rather than 403, so the
+        response cannot confirm that a job id exists.
+        The job id is named `jobId`, deliberately not `id`, so it can never be mistaken for the
+        group id the authorization check reads.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+      responses: { '200': { description: Export job status, content: { application/json: { schema: { $ref: '#/components/schemas/GroupMemberExportJob' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+  /community-stats:
+    get:
+      operationId: communityStats
+      x-mock-collection: users
+      description: >-
+        Community roster snapshot for the Community Leader dashboard (US-7.1), recomputed by the
+        nightly sync and read as a single item — never a live count over the roster.
+        Counting rules, fixed so the figures reconcile: MEMBERS ONLY (Administrators and leaders
+        are excluded, since they cannot earn points and would depress "% active"), DEACTIVATED
+        EXCLUDED, and `newByQuarter` counts ACCOUNT CREATION on that same members-only basis so
+        "new" is always a subset of "total". Community Leaders only.
+      responses: { '200': { description: Roster snapshot, content: { application/json: { schema: { $ref: '#/components/schemas/CommunityStats' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /groups/{id}/growth:
+    get:
+      operationId: groupGrowth
+      x-mock-collection: groups
+      description: >-
+        Member count for the group at the END of each of the last `quarters` quarters, oldest first
+        (US-7.3). Derived from the append-only membership-event history (US-1.34), so members who
+        have since left are still counted in the quarters they belonged to. Aggregated server-side:
+        the response is a handful of integers whatever the group size.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: quarters, in: query, schema: { type: integer, minimum: 1, maximum: 12, default: 4 } }
+      responses: { '200': { description: Membership per quarter, content: { application/json: { schema: { $ref: '#/components/schemas/GroupGrowthList' } } } }, '400': { description: Invalid quarters, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /groups/{id}/leaders:
+    post:
+      operationId: assignLeader
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [memberId], properties: { memberId: { type: string } } } } } }
+      responses: { '200': { description: Assigned }, '501': { $ref: '#/components/responses/NI' } }
+  /groups/{id}/members/{memberId}:
+    delete:
+      operationId: removeMember
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }, { name: memberId, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: Removed (US-1.17) }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /membership-history:
+    get:
+      operationId: membershipHistory
+      x-mock-collection: membershipHistory
+      description: >-
+        Membership history (US-1.34). Optional cursor pagination on the per-group view
+        (2026-08-05, 13k+ scale) returns NEWEST FIRST; without limit/cursor the full
+        history is returned, which does not hold for a large group. memberId scope is
+        always small and stays unpaged.
+      parameters:
+        - { name: memberId, in: query, schema: { type: string } }
+        - { name: groupId, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 }, description: "Paged mode, groupId scope only." }
+        - { name: cursor, in: query, schema: { type: string }, description: "Opaque cursor from the previous page." }
+      responses: { '200': { description: History, content: { application/json: { schema: { $ref: '#/components/schemas/HistoryList' } } } }, '400': { description: Invalid cursor or limit, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /users/import:
+    post:
+      operationId: bulkImport
+      description: Row-level bulk import (US-1.31). `rows` are parsed client-side from the uploaded .csv (email, first_name, last_name required; city, country, professional_role, aws_project optional). Time zone is not an import column — imported users take the system-wide default time zone (Admin > Settings), overridable per user via Edit User.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [fileName, rows], properties: { fileName: { type: string }, rows: { type: array, items: { type: object } } } } } } }
+      responses: { '200': { description: Import report, content: { application/json: { schema: { type: object, properties: { created: { type: integer }, skipped: { type: integer }, rejected: { type: integer }, report: { type: array, items: { type: object, properties: { row: { type: integer }, outcome: { type: string } } } } } } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /users/export:
+    post:
+      operationId: startUserExport
+      description: 'Start an async CSV export of the admin user list (US-1.4 export action). Returns 202 immediately with a job id; the CSV is built by a worker Lambda and collected via getUserExport. Asynchronous because a synchronous export cannot work at this scale for two independent reasons: the listing exceeds API Gateway''s hard 29s integration timeout, and the JSON response exceeds Lambda''s 6MB payload limit past roughly 20k users. The export honours the same q/role/status filters as listUsers, so the CSV matches the filtered table. Rows are read from the OpenSearch index, so an export reflects the INDEX and can lag the roster (the index is populated asynchronously from the DynamoDB stream). At most one export runs per administrator at a time.'
+      requestBody: { required: false, content: { application/json: { schema: { type: object, properties: { q: { type: string, description: 'Free-text match on name, email or professional role.' }, role: { type: string, enum: [Administrator, CommunityLeader, UserGroupLeader, Member] }, status: { type: string, enum: [Active, Inactive] } } } } } }
+      responses: { '202': { description: Export accepted and queued, content: { application/json: { schema: { $ref: '#/components/schemas/UserExportJob' } } } }, '400': { description: 'An export is already running for this administrator', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /users/export/{id}:
+    get:
+      operationId: getUserExport
+      description: 'Progress and result of an export job, polled by the SPA while the worker runs. Once status is `ready` the response carries a freshly minted, short-lived presigned download URL — it is generated per request and never stored, so a stale response cannot be replayed. Scoped to the requesting administrator; another administrator''s job id is reported as not found rather than forbidden, so the response cannot confirm it exists. The generated file is removed by a 1-day bucket lifecycle rule (there is no delete-on-download: a presigned GET is a direct browser-to-S3 transfer the service never observes completing).'
+      parameters: [ { name: id, in: path, required: true, schema: { type: string }, description: 'Export job id returned by startUserExport.' } ]
+      responses: { '200': { description: Export job status, content: { application/json: { schema: { $ref: '#/components/schemas/UserExportJob' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+components:
+  responses:
+    NotFound: { description: Not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Forbidden: { description: Forbidden, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NI: { description: Not yet implemented, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  schemas:
+    Session: { type: object, properties: { token: { type: string }, refreshToken: { type: string, description: 'Cognito refresh token (additive 2026-08-27), for re-minting the ID token mid-session so custom claims (role, member_group_ids) become current — group membership is carried in the token and decides what a Member may see. OMITTED on the OTP path: carrying it in the OTP challenge record would park a long-lived credential in the database awaiting an emailed code, so OTP-gated sessions cannot refresh and pick up membership changes only at next sign-in.' }, role: { type: string }, otpRequired: { type: boolean }, ledGroupId: { type: string, description: 'Present for a UserGroupLeader only (additive 2026-08-05). A UGL leads exactly one group (BR-G7), so the SPA routes straight to My Group without a discovery round-trip.' } } }
+    Group: { type: object, required: [id, name], properties: { id: { type: string }, name: { type: string }, description: { type: string }, approvalRequired: { type: boolean }, myState: { type: string, enum: [member, requested], description: 'Per-caller (computed, additive 2026-08-04): member = caller currently belongs; requested = caller has a pending join request (drives the Requested tag + Withdraw button, US-1.8/1.21).' }, leaderIds: { type: array, items: { type: string } }, leaders: { type: array, description: 'Resolved leader display info (name + email per US-1.8) — leadership is not membership, so leaders may be absent from the members list.', items: { type: object, properties: { id: { type: string }, firstName: { type: string }, lastName: { type: string }, email: { type: string } } } }, memberCount: { type: integer }, createdAt: { type: string }, status: { type: string, description: 'Active | SoftDeleted (soft-deleted rows are returned only to Community Leaders via includeDeleted=true, US-1.11).' }, deletedAt: { type: string } } }
+    GroupInput: { type: object, required: [name, leaderIds], properties: { name: { type: string }, description: { type: string }, approvalRequired: { type: boolean }, leaderIds: { type: array, minItems: 1, items: { type: string }, description: 'User IDs to lead the group. Members are promoted to UserGroupLeader atomically on create (US-1.9); a person can lead only one group (BR-G7).' } } }
+    GroupList: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/Group' } }, count: { type: integer }, cursor: { type: string, description: 'Present when a next page exists (paged mode only) — pass it back as the cursor query param.' } } }
+    JoinRequest: { type: object, required: [id, memberId, groupId, status], properties: { id: { type: string }, memberId: { type: string }, memberName: { type: string, description: 'Resolved requester display name (optional, additive).' }, memberEmail: { type: string }, groupId: { type: string }, groupName: { type: string, description: 'Resolved on the cross-group queue (US-1.21 CL view).' }, status: { type: string }, message: { type: string }, requestedAt: { type: string } } }
+    JoinRequestList: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/JoinRequest' } }, count: { type: integer }, total: { type: integer, description: 'Total pending requests (paged mode only) — drives the "Pending Join Requests (N)" heading and the tab badge.' }, cursor: { type: string, description: 'Present when a next page exists (paged mode only).' } } }
+    GroupMemberExportJob: { type: object, required: [jobId, status], description: 'Same lifecycle as UserExportJob — one worker serves both exports — but declared separately because `total` becomes null for a different reason (see below) and the CSV carries two extra columns, roleInGroup and joinedAt.', properties: { jobId: { type: string }, status: { type: string, enum: [queued, running, ready, failed] }, processed: { type: integer, description: 'Rows written so far.' }, total: { type: integer, nullable: true, description: 'Exact number of rows the roster will yield — current members plus any leader who is not also a member, since the listing emits leaders as a first block. Counted once when the job starts. Null when a keyword filter is applied, because the projection keeps no counter for a filtered subset; the client then shows an indeterminate bar. On completion this is reconciled to the rows actually written, so a finished export always reads 100%.' }, percent: { type: integer, nullable: true, description: 'Clamped 0-100 progress derived from processed/total. Null when total is unknown. Clamped because members can join or leave while the export runs.' }, fileName: { type: string, description: 'Suggested download filename, timestamped so successive exports do not overwrite each other.' }, url: { type: string, description: 'Presigned download URL. Present only when status is ready; minted per request and never stored.' }, expiresInSeconds: { type: integer, description: 'Lifetime of the presigned URL (present alongside url).' }, error: { type: string, description: 'Present only when status is failed. Deliberately generic — exception detail is logged, not returned.' } } }
+    UserExportJob: { type: object, required: [jobId, status], properties: { jobId: { type: string }, status: { type: string, enum: [queued, running, ready, failed] }, processed: { type: integer, description: 'Rows written so far.' }, total: { type: integer, nullable: true, description: 'Exact number of matching users, counted once when the job starts. Null when the search index is unavailable, in which case the client shows an indeterminate progress bar rather than a fabricated figure. On completion this is reconciled to the rows actually written, so a finished export always reads 100%.' }, percent: { type: integer, nullable: true, description: 'Clamped 0-100 progress derived from processed/total. Null when total is unknown. Clamped because users can be created while the export runs.' }, fileName: { type: string, description: 'Suggested download filename, timestamped so successive exports do not overwrite each other.' }, url: { type: string, description: 'Presigned download URL. Present only when status is ready; minted per request and never stored.' }, expiresInSeconds: { type: integer, description: 'Lifetime of the presigned URL (present alongside url).' }, error: { type: string, description: 'Present only when status is failed. Deliberately generic — exception detail is logged, not returned.' } } }
+    CommunityStats: { type: object, required: [totalMembers, newByQuarter], properties: { totalMembers: { type: integer, description: 'Active accounts with role=Member.' }, newByQuarter: { type: object, additionalProperties: { type: integer }, description: 'Quarter key -> member accounts created in it (trailing 8 quarters).' }, totalByQuarter: { type: object, additionalProperties: { type: integer }, description: 'Quarter key -> roster size recorded at the end of that quarter, for the membership-growth trend. The CURRENT quarter always equals totalMembers, so the card and the chart line cannot disagree. Past quarters are carried forward from earlier runs and never recomputed — a past roster cannot be reconstructed once accounts are deactivated — so the series starts short and fills in rather than being backfilled with guesses.' }, computedAt: { type: string, nullable: true, description: 'When the nightly job last ran. Absent until its first run; the dashboard shows it as an "as of" disclaimer and must not fabricate it.' } } }
+    MembersByGroupRow: { type: object, required: [groupId, members], properties: { groupId: { type: string }, groupName: { type: string }, members: { type: integer, description: 'Memberships held at the end of the quarter. Excludes leaders (leading is not membership) and counts anyone who belonged then, including accounts deactivated since — so it matches the group leader''s own card.' } } }
+    MembersByGroup: { type: object, required: [quarter, items, count], properties: { quarter: { type: string }, items: { type: array, items: { $ref: '#/components/schemas/MembersByGroupRow' }, description: 'Active groups only, largest first — the chart is a ranked comparison.' }, count: { type: integer }, totalMembers: { type: integer, nullable: true, description: 'Roster basis (active role=Member), identical to the Total Members card. Null for a past quarter, which the roster cannot reconstruct.' }, inAnyGroup: { type: integer, nullable: true, description: 'DISTINCT roster members holding at least one membership.' }, noGroup: { type: integer, nullable: true, description: 'Roster members holding no membership, counted directly. inAnyGroup + noGroup == totalMembers always holds.' }, overlap: { type: integer, nullable: true, description: 'Roster members belonging to MORE than one group. They appear in every bar they belong to, so a non-zero value is why the bars sum above totalMembers.' }, offRoster: { type: integer, nullable: true, description: 'Memberships held by accounts outside the roster basis (a leader who joined another group, or a member deactivated since). They appear in a group bar but not in totalMembers.' }, computedAt: { type: string, nullable: true, description: 'When the group-member-stats nightly job last ran (additive 2026-08-27). Absent until its first run; the dashboard shows it as an "as of" disclaimer and must not fabricate it. Previously the panel borrowed CommunityStats.computedAt, which described a different job.' } } }
+    GroupGrowthPoint: { type: object, required: [quarter, members], properties: { quarter: { type: string, description: 'YYYY-Qn — same key format as Contributions & Scoring so both series share one axis.' }, members: { type: integer, description: 'Members in the group at the end of that quarter, from the membership-event history.' } } }
+    GroupGrowthList: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/GroupGrowthPoint' }, description: 'Oldest quarter first — chart x-axis order.' }, count: { type: integer } } }
+    History: { type: object, required: [id, memberId, groupId, type], properties: { id: { type: string }, memberId: { type: string }, memberName: { type: string, description: 'Resolved display name (additive).' }, groupId: { type: string }, groupName: { type: string }, type: { type: string }, at: { type: string } } }
+    HistoryList: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/History' } }, count: { type: integer }, cursor: { type: string, description: 'Present when a next page exists (paged mode only).' } } }
+    User: { type: object, required: [id, email, role, status], properties: { id: { type: string }, email: { type: string }, firstName: { type: string }, lastName: { type: string }, role: { type: string }, status: { type: string }, city: { type: string }, country: { type: string }, professionalRole: { type: string }, awsProject: { type: boolean }, timeZone: { type: string }, groupIds: { type: array, items: { type: string } }, ledGroupId: { type: string }, roleInGroup: { type: string, enum: [UserGroupLeader, Member], description: 'Role WITHIN the requested group (additive 2026-08-05) — populated only by listGroupMembers, where leaders and members are listed together. Distinct from the portal-wide `role`.' }, joinedAt: { type: string, description: 'When this member joined the requested group — the approval moment for approval-required groups (BR-G5). Populated only by listGroupMembers, and absent for a leader who never joined (leadership is not membership).' } } }
+    UserList: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/User' } }, count: { type: integer }, cursor: { type: string, description: 'Present when a next page exists (paged mode only).' } } }
+    Error: { type: object, required: [code, message], properties: { code: { type: string }, message: { type: string }, correlationId: { type: string } } }

@@ -1,0 +1,60 @@
+{
+  "title": "ContributionsPointsEvents",
+  "description": "Domain events published by Contributions & Scoring (Unit 7), carried in the platform event envelope 'data' field, post-commit best-effort. Consumed by Notifications (US-8.15 rows: contribution decision, points adjusted) and Analytics. NOTE: there is NO TierAchieved event — tier-achievement notifications were removed (DL19); tiers are runtime-derived and displayed, never notified.",
+  "oneOf": [
+    { "$ref": "#/definitions/PointsAwarded" },
+    { "$ref": "#/definitions/PointsAdjusted" },
+    { "$ref": "#/definitions/ContributionRejected" }
+  ],
+  "definitions": {
+    "PointsAwarded": {
+      "type": "object",
+      "description": "Points appended to the ledger for a member (auto award or evidence approval). `entries` carries the per-group portions (a community-wide award splits into several).",
+      "required": ["memberId", "source"],
+      "properties": {
+        "memberId": { "type": "string" },
+        "activity": { "type": "string" },
+        "source": { "type": "string", "enum": ["auto", "evidence"] },
+        "sourceRef": { "type": "string" },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "groupId": { "type": "string" },
+              "points": { "type": "integer" },
+              "quarter": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "PointsAdjusted": {
+      "type": "object",
+      "description": "A leader manually adjusted or reversed points (US-6.15). The affected member is notified in-portal (US-8.15 row). `reverses` set when this reversed a specific entry.",
+      "required": ["memberId", "groupId", "delta"],
+      "properties": {
+        "memberId": { "type": "string" },
+        "groupId": { "type": "string" },
+        "quarter": { "type": "string" },
+        "delta": { "type": "integer" },
+        "reason": { "type": "string" },
+        "adjustorId": { "type": "string" },
+        "reverses": { "type": ["string", "null"] }
+      }
+    },
+    "ContributionRejected": {
+      "type": "object",
+      "description": "An evidence submission was rejected — by a leader (with reason) or by the system when the member left/was removed from the selected group before approval (`system: true`, US-6.6). Notification trigger only.",
+      "required": ["memberId", "submissionId"],
+      "properties": {
+        "memberId": { "type": "string" },
+        "submissionId": { "type": "string" },
+        "groupId": { "type": "string" },
+        "activity": { "type": "string" },
+        "reason": { "type": "string" },
+        "system": { "type": "boolean" }
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+# Grype vulnerability scanner configuration
+# See: https://github.com/anchore/grype#configuration
+
+ignore:
+  # GHSA-67mh-4wv8-2f99 — esbuild dev server vulnerability.
+  # esbuild is a build-time dependency only (Vite bundler); it is never
+  # deployed or exposed in production. The SPA is compiled to static assets
+  # and served via S3/CloudFront. The esbuild dev server is never reachable
+  # from outside a developer's local machine.
+  - vulnerability: GHSA-67mh-4wv8-2f99
+    reason: "Dev-only build tool dependency — esbuild is never deployed or exposed"

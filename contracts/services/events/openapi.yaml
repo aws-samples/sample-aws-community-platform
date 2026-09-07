@@ -1,0 +1,586 @@
+# openapi: 3.0.3
+# Events Service API — v2.3.0 (Content Library rework, 2026-08-18).
+# Removed: GET /events/content-library (contentLibrary operationId — replaced by standalone Library).
+# Added: GET/POST /library, GET /library/tags, PUT/DELETE /library/{id}.
+# Added: LibraryResource, LibraryList schemas.
+# Previous: v2.2.0 (change request, 2026-08-06).
+openapi: 3.0.3
+info: { title: Events Service API, version: 2.3.0 }
+paths:
+  /events:
+    get:
+      operationId: listEvents
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: type, in: query, schema: { type: string } }
+        - { name: deliveryMode, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [Upcoming, Completed, Cancelled] } }
+        - { name: groupId, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string } }
+        - { name: to, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: memberId, in: query, schema: { type: string }, description: "With countOnly=true, scopes the attended-event count to this member (Member-Profiles activity-summary fan-out); defaults to the caller." }
+        - { name: countOnly, in: query, schema: { type: boolean }, description: "Return only { count } — the number of events the member has attended (RSVP attended flag), not a page of events." }
+      responses: { '200': { description: Events, content: { application/json: { schema: { $ref: '#/components/schemas/EventList' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+    post:
+      operationId: createEvent
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/EventInput' } } } }
+      responses: { '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Event' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/calendar:
+    get:
+      operationId: calendar
+      x-mock-collection: events
+      parameters:
+        - { name: from, in: query, schema: { type: string } }
+        - { name: to, in: query, schema: { type: string } }
+        - { name: groupId, in: query, schema: { type: string } }
+        - { name: type, in: query, schema: { type: string } }
+        - { name: deliveryMode, in: query, schema: { type: string } }
+      responses: { '200': { description: Calendar events, content: { application/json: { schema: { $ref: '#/components/schemas/EventList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/stats/by-type:
+    get:
+      operationId: eventStatsByType
+      x-mock-collection: events
+      description: >-
+        Events per quarter broken down by event type, oldest quarter first (US-7.2).
+        Counting rule is identical to the dashboard's "Group Events" stat card so the two cannot
+        disagree: the group's own events (community-wide excluded), attributed to the quarter the
+        event's own date (startsAt) falls in, every status EXCEPT Cancelled (so Upcoming and
+        Completed both count), and series parent rows skipped because their occurrences are
+        counted individually. A User Group Leader always gets the group they lead whatever groupId says;
+        a Community Leader may name a group (omitting it means the community-wide scope, which
+        is a scope of its own and not "all groups"). Members and Administrators are refused.
+        `types` lists only the event types that actually occurred in the window, in canonical
+        order, so a chart renders a few series rather than eight mostly-empty ones.
+      parameters:
+        - { name: groupId, in: query, schema: { type: string }, description: 'Community Leader only — ignored for a UGL, whose scope comes from their token.' }
+        - { name: quarters, in: query, schema: { type: integer, minimum: 1, maximum: 12, default: 4 } }
+      responses: { '200': { description: Completed events per quarter per type, content: { application/json: { schema: { $ref: '#/components/schemas/EventTypeStats' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/stats/by-group:
+    get:
+      operationId: eventStatsByGroup
+      x-mock-collection: events
+      description: >-
+        Event count per user group for ONE quarter (US-7.1). Community Leaders only.
+        The counting rule is identical to /events/stats/by-type and the dashboard's "Group Events"
+        card — the event's own date, every status except Cancelled, series parent rows skipped —
+        so a CL's per-group figure and that group's own leader always agree.
+        Community-wide events belong to no single group (BR-S1) and are returned as
+        `communityWide` rather than folded into a group or dropped, so the rows account for every
+        event in the quarter: total == communityWide + sum(items[].events).
+        This service holds no group registry, so the ids are supplied by the caller (which already
+        has them from /groups). Safe because only a CL may call this and a CL may read any group;
+        the list is de-duplicated and capped at 100 so a hand-built query string cannot turn one
+        request into an unbounded fan-out.
+        Declared BEFORE /events/{id} and must stay that way, so "stats" is never taken for an id.
+      parameters:
+        - { name: quarter, in: query, schema: { type: string }, description: 'Defaults to the current quarter.' }
+        - { name: groupIds, in: query, schema: { type: string }, description: 'Comma-separated group ids, max 100. Omitted or empty returns communityWide only.' }
+      responses: { '200': { description: Events per group for the quarter, content: { application/json: { schema: { $ref: '#/components/schemas/EventGroupStats' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /library:
+    get:
+      operationId: searchLibrary
+      summary: Search the Content Library (search-first — at least one filter required)
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: format, in: query, schema: { type: string, enum: [Slides, PDF, Doc, Recording, Link] } }
+        - { name: topic, in: query, schema: { type: string } }
+        - { name: source, in: query, schema: { type: string, enum: [event-material, member-contribution, curator-direct] } }
+        - { name: limit, in: query, schema: { type: integer } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses: { '200': { description: Library resources, content: { application/json: { schema: { $ref: '#/components/schemas/LibraryList' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+    post:
+      operationId: addLibraryResource
+      summary: Curator direct add (Path 3) — CL/UGL only
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/LibraryResourceInput' } } } }
+      responses: { '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/LibraryResource' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /library/tags:
+    get:
+      operationId: listLibraryTags
+      summary: Autocomplete tag suggestions
+      parameters:
+        - { name: prefix, in: query, schema: { type: string } }
+      responses: { '200': { description: Tags, content: { application/json: { schema: { type: object, properties: { tags: { type: array, items: { type: string } } } } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /library/{id}:
+    put:
+      operationId: updateLibraryResource
+      summary: Curator edit — CL/UGL only
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/LibraryResourceInput' } } } }
+      responses: { '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/LibraryResource' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+    delete:
+      operationId: deleteLibraryResource
+      summary: Curator delete — CL/UGL only
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: Deleted }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}:
+    get:
+      operationId: getEvent
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Event, content: { application/json: { schema: { $ref: '#/components/schemas/Event' } } } }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+    put:
+      operationId: editEvent
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/EventInput' } } } }
+      responses: { '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Event' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+    delete:
+      operationId: cancelEvent
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: Cancelled }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/complete:
+    post:
+      operationId: completeEvent
+      description: Manually mark an event complete (CL/UGL). Attendance must be recorded first — completing with no attendance records returns 400 with a guiding message. Recording attendance auto-completes the event (BR-L3), so this manual path applies when no attendance exists yet.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Completed, content: { application/json: { schema: { $ref: '#/components/schemas/Event' } } } }, '400': { description: 'Attendance not yet recorded, or the event date has not passed.', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/ics:
+    get:
+      operationId: getEventIcs
+      description: Calendar invite for the mockup's "Download .ics" action (US-2.8).
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: iCalendar body, content: { text/calendar: { schema: { type: string } } } }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/rsvp:
+    post:
+      operationId: rsvpEvent
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [response], properties: { response: { type: string, enum: [yes, no] } } } } } }
+      responses: { '200': { description: RSVP recorded, content: { application/json: { schema: { $ref: '#/components/schemas/RsvpResult' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/rsvps:
+    get:
+      operationId: listRsvps
+      x-mock-collection: rsvps
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: RSVPs, content: { application/json: { schema: { $ref: '#/components/schemas/RsvpList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/materials:
+    get:
+      operationId: listMaterials
+      x-mock-collection: materials
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Materials, content: { application/json: { schema: { $ref: '#/components/schemas/MaterialList' } } } }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+    post:
+      operationId: addMaterial
+      x-mock-collection: materials
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MaterialInput' } } } }
+      responses: { '201': { description: Added, content: { application/json: { schema: { $ref: '#/components/schemas/Material' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/materials/upload-url:
+    post:
+      operationId: getMaterialUploadUrl
+      description: Mint a short-lived presigned PUT for a direct-to-S3 material upload (US-2.15). Type and size are validated BEFORE minting.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [fileName, sizeBytes], properties: { fileName: { type: string }, sizeBytes: { type: integer }, contentType: { type: string } } } } } }
+      responses: { '200': { description: Upload target, content: { application/json: { schema: { $ref: '#/components/schemas/UploadTarget' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/materials/{materialId}:
+    put:
+      operationId: replaceMaterial
+      # x-mock-collection pins the generated mock to the `materials` fixture.
+      # Without it the mock derives the collection from the first path segment
+      # (`events`) and echoes an EVENT row, which cannot satisfy the Material
+      # schema's required `name` — the contract gate catches exactly that.
+      x-mock-collection: materials
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }, { name: materialId, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/MaterialInput' } } } }
+      responses: { '200': { description: Replaced, content: { application/json: { schema: { $ref: '#/components/schemas/Material' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+    delete:
+      operationId: removeMaterial
+      description: Deletes the S3 object BEFORE the metadata row and fails closed, so no object is ever orphaned without an owning record (BR-M7).
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }, { name: materialId, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: Removed }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '502': { $ref: '#/components/responses/StorageError' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/attendance:
+    post:
+      operationId: recordAttendance
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { userIds: { type: array, items: { type: string } }, emails: { type: string } } } } } }
+      responses: { '200': { description: Attendance recorded, content: { application/json: { schema: { $ref: '#/components/schemas/AttendanceResult' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/attendance/import:
+    post:
+      operationId: importAttendanceCsv
+      description: CSV-only bulk attendance (US-2.16). xlsx is deliberately unsupported — the SheetJS dependency carries unpatched high-severity CVEs and was removed from this repo.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [csv], properties: { csv: { type: string } } } } } }
+      responses: { '200': { description: Per-row import report, content: { application/json: { schema: { $ref: '#/components/schemas/ImportReport' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/attendance/teams:
+    get:
+      operationId: teamsAttendance
+      description: Fetch + email-match Teams participants for REVIEW. Awards nothing (US-2.12, BR-T4).
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Reviewable batch, content: { application/json: { schema: { $ref: '#/components/schemas/TeamsBatch' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '503': { $ref: '#/components/responses/NotConfigured' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/attendance/teams/apply:
+    post:
+      operationId: applyTeamsAttendance
+      description: Commit the reviewed batch and award points. Applies once (BR-T5).
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { participants: { type: array, items: { $ref: '#/components/schemas/TeamsParticipant' } } } } } } }
+      responses: { '200': { description: Applied, content: { application/json: { schema: { $ref: '#/components/schemas/AttendanceResult' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '409': { $ref: '#/components/responses/Conflict' }, '503': { $ref: '#/components/responses/NotConfigured' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/designations:
+    get:
+      operationId: listDesignations
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Designations, content: { application/json: { schema: { $ref: '#/components/schemas/DesignationList' } } } }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+    put:
+      operationId: setDesignations
+      description: Only designees holding the Member role are point-eligible (BR-P3); others may be designated but earn nothing. External presenters (names, not portal users) are never eligible.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { presenters: { type: array, items: { type: string } }, organizers: { type: array, items: { type: string } }, externalPresenters: { type: array, items: { type: string } } } } } } }
+      responses: { '200': { description: Set, content: { application/json: { schema: { $ref: '#/components/schemas/DesignationsAck' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/upload-links:
+    get:
+      operationId: listUploadLinks
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Links, content: { application/json: { schema: { $ref: '#/components/schemas/UploadLinkList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+    post:
+      operationId: createUploadLink
+      description: The plaintext token is returned EXACTLY ONCE, here. It is stored hashed (BR-U3).
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { expiryDays: { type: integer, enum: [7, 14, 30, 90] }, maxSizeBytes: { type: integer }, note: { type: string } } } } } }
+      responses: { '201': { description: Link, content: { application/json: { schema: { $ref: '#/components/schemas/UploadLinkCreated' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/upload-links/{linkId}:
+    delete:
+      operationId: revokeUploadLink
+      description: Immediate for all future mints; already-issued short-lived URLs run out their remaining life (BR-U4).
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }, { name: linkId, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: Revoked }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+  /events/{id}/upload-links/{linkId}/files:
+    get:
+      operationId: listUploadedFiles
+      description: Owner-side view with fresh short-lived presigned GET URLs (BR-U6).
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }, { name: linkId, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Uploaded files, content: { application/json: { schema: { $ref: '#/components/schemas/UploadedFileList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+  /event-uploads/{token}:
+    post:
+      operationId: publicUploadMint
+      description: >-
+        UNAUTHENTICATED (US-2.21). Own base path because /public belongs to Settings and
+        gen_api_edge.py hard-fails on base-path collision (F1). Write-only: mints ONE
+        single-object presigned PUT. No list, no read, no delete. Unknown, expired and
+        revoked tokens are indistinguishable — all return 404 (BR-U8).
+      parameters: [{ name: token, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [fileName], properties: { fileName: { type: string }, sizeBytes: { type: integer } } } } } }
+      responses: { '200': { description: Upload target, content: { application/json: { schema: { $ref: '#/components/schemas/UploadTarget' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '404': { $ref: '#/components/responses/NotFound' }, '429': { description: Throttled, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '501': { $ref: '#/components/responses/NI' } }
+components:
+  responses:
+    NotFound: { description: Not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Forbidden: { description: Forbidden, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    BadRequest: { description: Validation failed, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Conflict: { description: Illegal state transition or duplicate, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotConfigured: { description: Optional integration disabled or storage unconfigured, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    StorageError: { description: Object-store failure, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NI: { description: Not yet implemented, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  schemas:
+    # groupId absent/null => community-wide. The literal string "Community-wide" is
+    # a display label and is never persisted (BR-S1).
+    Event:
+      type: object
+      required: [id, title, type, deliveryMode, status]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        description: { type: string }
+        type: { type: string }
+        deliveryMode: { type: string }
+        groupId: { type: string, nullable: true }
+        status: { type: string }
+        startsAt: { type: string, description: 'ISO-8601 start of the event.' }
+        endsAt: { type: string, description: 'ISO-8601 end of the event. An event owns a time span; a single-instant meeting is just a short span and a hackathon a multi-day one. Capped at 30 days.' }
+        location: { type: string }
+        createdBy: { type: string }
+        announceOnCreate: { type: boolean }
+        announceByEmail: { type: boolean }
+        teamsMeetingId: { type: string, nullable: true }
+        rsvpYesCount: { type: integer }
+        rsvpNoCount: { type: integer }
+        attendedCount: { type: integer }
+        presenterCount: { type: integer }
+        organizerCount: { type: integer }
+        pointsAwarded: { type: integer, nullable: true }
+        attendancePoints: { type: integer, description: Read from Contributions at request time. OMITTED when unavailable — never an error (BR-P1) }
+        deliveryPoints: { type: integer }
+        myRsvp: { type: string, nullable: true, description: The caller's own response, or null }
+        myAttended: { type: boolean }
+        canManage: { type: boolean, description: Computed per caller (BR-A4/A5) }
+        completedAt: { type: string, nullable: true }
+        cancelledAt: { type: string, nullable: true }
+        createdAt: { type: string }
+        updatedAt: { type: string }
+    EventInput:
+      type: object
+      required: [title, type, deliveryMode]
+      properties:
+        title: { type: string }
+        description: { type: string }
+        type: { type: string }
+        deliveryMode: { type: string }
+        groupId: { type: string, nullable: true }
+        startsAt: { type: string, description: 'ISO-8601 start. Required on create; must be in the future.' }
+        endsAt: { type: string, description: 'ISO-8601 end. Required whenever startsAt is set; must be after startsAt and within 30 days of it.' }
+        location: { type: string, description: 'Free text for every delivery mode — a join link, a street address, or a meeting room name. An explicit http:// URL is rejected so a private event''s join link never travels in cleartext (BR-V3); https:// and plain text are both accepted.' }
+        presenters: { type: array, items: { type: string } }
+        organizers: { type: array, items: { type: string } }
+        externalPresenters: { type: array, items: { type: string }, description: 'Names of presenters who are not portal users. Never points-eligible.' }
+        announceOnCreate: { type: boolean }
+        announceByEmail: { type: boolean }
+        teamsMeetingId: { type: string, nullable: true }
+    EventGroupStatsRow:
+      type: object
+      required: [groupId, events]
+      properties:
+        groupId: { type: string }
+        events: { type: integer, description: 'Events dated in the quarter for this group (Upcoming + Completed, never Cancelled, series parents excluded).' }
+    EventGroupStats:
+      type: object
+      required: [quarter, items, count, communityWide, total]
+      properties:
+        quarter: { type: string }
+        items: { type: array, items: { $ref: '#/components/schemas/EventGroupStatsRow' }, description: 'One row per requested group, largest first — the chart is a ranked comparison.' }
+        count: { type: integer, description: 'Groups counted, after de-duplication.' }
+        communityWide: { type: integer, description: 'Events belonging to no group. Rendered as its own bar so the rows account for the whole quarter.' }
+        total: { type: integer, description: 'communityWide + sum(items[].events).' }
+    EventTypeStatsPoint:
+      type: object
+      required: [quarter, total, counts]
+      properties:
+        quarter: { type: string, description: 'YYYY-Qn — same key format as Identity & Access and Contributions & Scoring.' }
+        total: { type: integer, description: 'Events in the quarter across all types (Upcoming + Completed, never Cancelled).' }
+        counts: { type: object, additionalProperties: { type: integer }, description: 'Event type -> count. Types with no events in the quarter are omitted.' }
+    EventTypeStats:
+      type: object
+      required: [quarters, types, items, count]
+      properties:
+        groupId: { type: string, nullable: true, description: 'Scope the counts belong to; null means community-wide.' }
+        quarters: { type: array, items: { type: string }, description: 'Oldest quarter first — chart x-axis order.' }
+        types: { type: array, items: { type: string }, description: 'Event types present in the window, canonical order — the series to render.' }
+        items: { type: array, items: { $ref: '#/components/schemas/EventTypeStatsPoint' } }
+        count: { type: integer }
+    EventList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Event' } }
+        count: { type: integer }
+        cursor: { type: string, nullable: true }
+    Rsvp:
+      type: object
+      required: [eventId, userId, response]
+      properties:
+        eventId: { type: string }
+        userId: { type: string }
+        userEmail: { type: string }
+        userName: { type: string }
+        userRole: { type: string, description: 'Denormalised from claims at RSVP time, refreshed on re-response' }
+        response: { type: string }
+        respondedAt: { type: string }
+        attended: { type: boolean }
+        attendedSource: { type: string, nullable: true }
+        pointsAwarded: { type: integer, nullable: true }
+    RsvpList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Rsvp' } }
+        count: { type: integer }
+        yesCount: { type: integer }
+        noCount: { type: integer }
+    RsvpResult:
+      type: object
+      properties:
+        response: { type: string }
+        rsvpYesCount: { type: integer }
+        rsvpNoCount: { type: integer }
+        icsAction: { type: string, description: request | cancel | none }
+    Material:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string }
+        eventId: { type: string }
+        kind: { type: string, description: file | link }
+        name: { type: string }
+        contentType: { type: string }
+        link: { type: string, nullable: true }
+        sizeBytes: { type: integer, nullable: true }
+        uploaded: { type: boolean }
+        scanState: { type: string, description: 'PendingScan | Clean | Quarantined (N1/J3) — only Clean is downloadable or indexed' }
+        downloadUrl: { type: string, nullable: true, description: Fresh short-lived presigned GET, never stored }
+        postEvent: { type: boolean }
+        addedBy: { type: string }
+        addedAt: { type: string }
+        eventTitle: { type: string, description: Content Library rows only }
+        eventDescription: { type: string, description: Content Library rows only }
+        groupId: { type: string, nullable: true }
+        eventStartsAt: { type: string }
+    MaterialInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        kind: { type: string }
+        contentType: { type: string }
+        link: { type: string }
+        s3Key: { type: string, description: Returned by getMaterialUploadUrl; confirms a completed direct upload }
+    MaterialList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Material' } }
+        count: { type: integer }
+        cursor: { type: string, nullable: true }
+    LibraryResource:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        description: { type: string }
+        format: { type: string, enum: [Slides, PDF, Doc, Recording, Link] }
+        topics: { type: array, items: { type: string } }
+        source: { type: string, enum: [event-material, member-contribution, curator-direct] }
+        submittedBy: { type: string }
+        submittedByName: { type: string, nullable: true }
+        addedBy: { type: string }
+        addedAt: { type: string }
+        eventId: { type: string, nullable: true }
+        eventTitle: { type: string, nullable: true }
+        downloadUrl: { type: string, nullable: true }
+        url: { type: string, nullable: true }
+        scanState: { type: string, enum: [PendingScan, Clean, Quarantined], nullable: true }
+        presignedUploadUrl: { type: string, nullable: true, description: 'Returned on POST only for file formats' }
+    LibraryResourceInput:
+      type: object
+      required: [title, description, format]
+      properties:
+        title: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 5000 }
+        format: { type: string, enum: [Slides, PDF, Doc, Recording, Link] }
+        topics: { type: array, items: { type: string } }
+        url: { type: string, description: 'Required when format=Link (https:// only)' }
+        fileName: { type: string, description: 'Required when format != Link' }
+        sizeBytes: { type: integer }
+    LibraryList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/LibraryResource' } }
+        count: { type: integer }
+        cursor: { type: string, nullable: true }
+    UploadTarget:
+      type: object
+      properties:
+        url: { type: string }
+        key: { type: string }
+        fileName: { type: string }
+        expiresInSeconds: { type: integer }
+    AttendanceResult:
+      type: object
+      properties:
+        recorded: { type: integer }
+        alreadyRecorded: { type: integer }
+        status: { type: string }
+        attendedCount: { type: integer }
+        pointsPerAttendee: { type: integer, nullable: true }
+    ImportReport:
+      type: object
+      properties:
+        total: { type: integer }
+        matched: { type: integer }
+        unmatched: { type: integer }
+        rows: { type: array, items: { type: object, properties: { row: { type: integer }, email: { type: string }, result: { type: string }, message: { type: string } } } }
+    TeamsParticipant:
+      type: object
+      properties:
+        displayName: { type: string }
+        email: { type: string }
+        joinTime: { type: string }
+        leaveTime: { type: string }
+        durationMinutes: { type: integer }
+        matchedUserId: { type: string, nullable: true }
+        matchStatus: { type: string }
+        include: { type: boolean }
+    TeamsBatch:
+      type: object
+      properties:
+        id: { type: string }
+        eventId: { type: string }
+        fetchedAt: { type: string }
+        appliedAt: { type: string, nullable: true }
+        matchedCount: { type: integer }
+        unmatchedCount: { type: integer }
+        participants: { type: array, items: { $ref: '#/components/schemas/TeamsParticipant' } }
+    Designation:
+      type: object
+      properties:
+        userId: { type: string }
+        displayName: { type: string, description: 'Denormalised at designation time so reads stay fan-out-free.' }
+        external: { type: boolean, description: 'True for a named external presenter who is not a portal user.' }
+        kind: { type: string, description: presenter | organizer }
+        roleAtDesignation: { type: string }
+        pointsEligible: { type: boolean }
+        ineligibleReason: { type: string, nullable: true }
+    DesignationList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Designation' } }
+        count: { type: integer }
+    DesignationsAck:
+      type: object
+      description: >-
+        The real service returns the same payload as listDesignations (items +
+        count). The fields are not marked required here because the generated
+        mock's generic update shape returns a single object rather than a list,
+        and the contract gate runs against the mock. Same accommodation already
+        used by UploadTarget. Clients should treat this as a DesignationList.
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Designation' } }
+        count: { type: integer }
+    UploadLink:
+      type: object
+      properties:
+        id: { type: string }
+        eventId: { type: string }
+        folderPrefix: { type: string }
+        expiresAt: { type: string }
+        maxSizeBytes: { type: integer, nullable: true }
+        note: { type: string }
+        revoked: { type: boolean }
+        expired: { type: boolean }
+        uploadCount: { type: integer }
+        createdBy: { type: string }
+        createdByEmail: { type: string }
+        createdAt: { type: string }
+    UploadLinkCreated:
+      allOf:
+        - $ref: '#/components/schemas/UploadLink'
+        - type: object
+          properties:
+            token: { type: string, description: Plaintext token — returned once, at creation, and never retrievable again }
+            url: { type: string, description: Full recipient URL }
+    UploadLinkList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/UploadLink' } }
+        count: { type: integer }
+    UploadedFile:
+      type: object
+      properties:
+        id: { type: string }
+        uploadLinkId: { type: string }
+        name: { type: string }
+        sizeBytes: { type: integer }
+        uploadedAt: { type: string }
+        downloadUrl: { type: string, nullable: true }
+        promotedMaterialId: { type: string, nullable: true }
+    UploadedFileList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/UploadedFile' } }
+        count: { type: integer }
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        correlationId: { type: string }
+        details: { type: array, items: { type: object } }

@@ -1,0 +1,24 @@
+{
+  "title": "AnnouncementPublished",
+  "description": "Published by Announcements (Unit 9) on create and on an edit that newly opts in to email. Wrapped in the platform event envelope. Consumed by Notifications (Unit 10), which sends email to the resolved audience ONLY when emailOptIn is true, using the configured sender/templates. Announcements never calls SES directly (BR-10). This is NOT a bell/in-portal notification trigger (BR-9). Consumers must be idempotent on the envelope id.",
+  "type": "object",
+  "required": ["announcementId", "title", "target", "emailOptIn"],
+  "properties": {
+    "announcementId": { "type": "string" },
+    "title": { "type": "string" },
+    "bodyPreview": { "type": "string", "description": "Short Markdown snippet (<=280 chars). The body is Markdown; the Notifications email path MUST render + escape it (the server does not HTML-sanitize — sanitization is a render-boundary concern)." },
+    "target": {
+      "type": "object",
+      "required": ["scope"],
+      "properties": {
+        "scope": { "type": "string", "enum": ["community", "groups"] },
+        "groupIds": { "type": "array", "items": { "type": "string" } }
+      },
+      "description": "Notifications resolves recipients from this (community-wide = all members+leaders; groups = members of the listed groups incl. their UGLs; Administrators excluded)."
+    },
+    "authorName": { "type": "string" },
+    "source": { "type": "string", "description": "Community-wide or the target group name(s)" },
+    "emailOptIn": { "type": "boolean", "description": "Notifications sends email only when true" },
+    "expiresAt": { "type": "string", "format": "date-time", "description": "Notifications should suppress a delayed email if already expired" }
+  }
+}

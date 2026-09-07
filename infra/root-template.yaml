@@ -1,0 +1,450 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Community Portal — ROOT template (customer entry point). Nests foundation ->
+  api-edge -> service stacks -> seed. Single-command install/update/delete.
+  Optional Semantic Search (OpenSearch + Bedrock) via EnableSemanticSearch.
+  Dependencies are passed as Parameters (never Fn::ImportValue) — D1.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - { Label: { default: General }, Parameters: [Stage, OpsEmail, AdminEmail] }
+      - { Label: { default: Features }, Parameters: [EnableSemanticSearch, AllowedEmailDomains] }
+      - { Label: { default: Artifacts }, Parameters: [TemplateBaseUrl] }
+
+Parameters:
+  Stage: { Type: String, Default: prod }
+  OpsEmail:
+    Type: String
+    Description: Email subscribed to ops/security alarms.
+    AllowedPattern: '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
+    ConstraintDescription: Must be a valid email address.
+  AdminEmail:
+    Type: String
+    Description: >
+      Real, deliverable mailbox for the bootstrap Administrator. Cognito sends the
+      admin invitation/verification email (and US-1.32 OTP re-verification) here.
+    AllowedPattern: '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
+    ConstraintDescription: Must be a valid, deliverable email address.
+  AllowedEmailDomains:
+    Type: String
+    Default: 'amazon.com'
+    Description: >
+      Comma-separated self-registration allow-list for Identity & Access (US-1.30).
+      Stop-gap parameter until the Settings service (Unit 11) exposes US-8.3 config.
+  EnableSemanticSearch: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  DeployNonce: { Type: String, Default: '0', Description: Changes each deploy to re-run seed/SPA custom resources. }
+  TemplateBaseUrl:
+    Type: String
+    Description: S3 base URL where nested templates were uploaded by `sam deploy`/`sam package`.
+
+Resources:
+  # Encryption keys needed BEFORE the data stacks. Depends on nothing, and that is
+  # the whole point: it breaks the Foundation <-> IdentityAccessData cycle that
+  # removing the explicit table names (cfn_nag W28) would otherwise create. Full
+  # reasoning at the top of infra/keys.yaml.
+  Keys:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/keys.yaml"
+      Parameters: { Stage: !Ref Stage }
+
+  Foundation:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/foundation.yaml"
+      Parameters:
+        Stage: !Ref Stage
+        OpsEmail: !Ref OpsEmail
+        DynamoDbKmsAccessPolicyArn: !GetAtt Keys.Outputs.DynamoDbKmsAccessPolicyArn
+        # Foundation now deploys AFTER IdentityAccessData because of this line.
+        # TokenClaimsFunction is a Cognito trigger and cannot live anywhere else, so
+        # the generated table name has to be handed to it.
+        IdentityAccessTableName: !GetAtt IdentityAccessData.Outputs.TableName
+
+  ApiEdge:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/api-edge.yaml"
+      Parameters:
+        Stage: !Ref Stage
+        UserPoolArn: !GetAtt Foundation.Outputs.UserPoolArn
+        # The private API is only reachable through this endpoint, and must name
+        # it in both its EndpointConfiguration and its resource policy.
+        ExecuteApiVpcEndpointId: !GetAtt Foundation.Outputs.ExecuteApiVpcEndpointId
+        LogsKmsKeyArn: !GetAtt Foundation.Outputs.LogsKmsKeyArn
+        # S3 server-access-log destination for SpaBucket and CloudFrontLogBucket
+        # (CKV_AWS_18). This !GetAtt is also what orders the two stacks, so the
+        # log-delivery grant in Foundation exists before S3 validates api-edge's
+        # LoggingConfiguration.
+        AccessLogBucketName: !GetAtt Foundation.Outputs.AccessLogBucketName
+
+  # ---------------------------------------------------------------------------
+  # Service stacks — one -data (DynamoDB, service-owned) + one -app (Lambda) per
+  # service. The root ORCHESTRATES; each service TEAM owns and extends its own
+  # template during real implementation (routes, GSIs, stream consumers, event
+  # rules). Dependencies passed as Parameters, never Fn::ImportValue (D1). Each
+  # -app implicitly depends on its -data + ApiEdge via !GetAtt. All nested
+  # templates live under the same TemplateBaseUrl prefix.
+  # ---------------------------------------------------------------------------
+
+  IdentityAccessData:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/service-identity-access-data.yaml"
+      Parameters: { Stage: !Ref Stage, DynamoDbKmsKeyArn: !GetAtt Keys.Outputs.DynamoDbKmsKeyArn }
+  IdentityAccessApp:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/service-identity-access-app.yaml"
+      Parameters:
+        Stage: !Ref Stage
+        RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
+        PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
+        RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
+        EventBusName: !GetAtt Foundation.Outputs.EventBusName
+        TableName: !GetAtt IdentityAccessData.Outputs.TableName
+        TableArn: !GetAtt IdentityAccessData.Outputs.TableArn
+        StreamArn: !GetAtt IdentityAccessData.Outputs.StreamArn
+        IdempotencyTableName: !GetAtt IdentityAccessData.Outputs.IdempotencyTableName
+        UserPoolId: !GetAtt Foundation.Outputs.UserPoolId
+        UserPoolArn: !GetAtt Foundation.Outputs.UserPoolArn
+        UserPoolClientId: !GetAtt Foundation.Outputs.UserPoolClientId
+        SesSenderAddress: !Ref AdminEmail
+        AllowedEmailDomains: !Ref AllowedEmailDomains
+        # MIGRATED to the private API. identity-access's only fan-out is
+        # SettingsClient, which reads GET /internal/settings — a route with no
+        # authorizer, so unlike the others it forwards no bearer token and there
+        # is no authorizer variable to get wrong. /internal is emitted ONLY into
+        # the private API (gen_api_edge.PRIVATE_ONLY_BASES), so this call is
+        # reachable only through the execute-api VPC endpoint by construction.
+        # It read /public/settings until 2026-08-28; that route is unauthenticated
+        # AND internet-facing, which made allowedEmailDomains and otpIntervalDays
+        # world-readable for no reason (no pre-login caller used them).
+        #
+        # It also fails soft to ENV DEFAULTS for allowedEmailDomains,
+        # selfRegistrationEnabled and otpIntervalDays. Documented staleness is up
+        # to 30s (the client cache TTL); silently reverting to build-time defaults
+        # is a different thing, and it is what fired
+        # identity-access-dev-authz-degradations earlier today on the PUBLIC path
+        # with "The read operation timed out". Moving to the shorter, tighter-tail
+        # private path is a reduction in that risk, not an addition.
+        ApiBaseUrl: !GetAtt ApiEdge.Outputs.PrivateApiVpceUrl
+        EnableSemanticSearch: !Ref EnableSemanticSearch
+        OpenSearchEndpoint: !GetAtt Foundation.Outputs.OpenSearchEndpoint
+        OpenSearchCollectionArn: !GetAtt Foundation.Outputs.OpenSearchCollectionArn
+        OpsAlarmTopicArn: !GetAtt Foundation.Outputs.OpsAlarmTopicArn
+        PrivateSubnetIds: !GetAtt Foundation.Outputs.PrivateSubnetIds
+        LambdaSecurityGroupId: !GetAtt Foundation.Outputs.LambdaSecurityGroupId
+        LogsKmsKeyArn: !GetAtt Foundation.Outputs.LogsKmsKeyArn
+        DynamoDbKmsAccessPolicyArn: !GetAtt Keys.Outputs.DynamoDbKmsAccessPolicyArn
+        # SQS CMK + use policy for this stack's queues (CKV_AWS_27 / cfn_nag W48).
+        SqsKmsKeyArn: !GetAtt Keys.Outputs.SqsKmsKeyArn
+        SqsKmsAccessPolicyArn: !GetAtt Keys.Outputs.SqsKmsAccessPolicyArn
+        UserExportBucketName: !GetAtt Foundation.Outputs.UserExportBucketName
+        UserExportBucketArn: !GetAtt Foundation.Outputs.UserExportBucketArn
+
+  MemberProfilesData:
+    Type: AWS::CloudFormation::Stack
+    Properties: { TemplateURL: !Sub "${TemplateBaseUrl}/service-member-profiles-data.yaml", Parameters: { Stage: !Ref Stage, DynamoDbKmsKeyArn: !GetAtt Keys.Outputs.DynamoDbKmsKeyArn } }
+  MemberProfilesApp:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/service-member-profiles-app.yaml"
+      Parameters:
+        Stage: !Ref Stage
+        RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
+        PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
+        RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
+        EventBusName: !GetAtt Foundation.Outputs.EventBusName
+        TableName: !GetAtt MemberProfilesData.Outputs.TableName
+        TableArn: !GetAtt MemberProfilesData.Outputs.TableArn
+        StreamArn: !GetAtt MemberProfilesData.Outputs.StreamArn
+        IdempotencyTableName: !GetAtt MemberProfilesData.Outputs.IdempotencyTableName
+        SpaBucketName: !GetAtt ApiEdge.Outputs.SpaBucketName
+        # MIGRATED to the private API — the LAST of the seven, and deliberately
+        # last because it is the largest fan-out surface: FanOutClient is used by
+        # profile_service (2 sites), activity_service (4 parallel siblings) and
+        # shoutout_service (group-name plus settings), and this template carries
+        # more execute-api grants than any other.
+        #
+        # It is also the one whose failure mode is purely cosmetic-to-quiet rather
+        # than authorisation-bearing: fan_out_client catches the error, returns
+        # None, and the caller omits the field, so a 200 comes back with data
+        # missing. That is why it already had the only pre-existing degradation
+        # alarm in the codebase (FanOutFailures) — and why every other service now
+        # has one too.
+        #
+        # With this, NO service reaches the public API for service-to-service
+        # calls. The browser still does, and PublicUploadBaseUrl on events still
+        # does, both by design.
+        ApiBaseUrl: !GetAtt ApiEdge.Outputs.PrivateApiVpceUrl
+        EnableSemanticSearch: !Ref EnableSemanticSearch
+        OpenSearchEndpoint: !GetAtt Foundation.Outputs.OpenSearchEndpoint
+        OpenSearchCollectionArn: !GetAtt Foundation.Outputs.OpenSearchCollectionArn
+        OpsAlarmTopicArn: !GetAtt Foundation.Outputs.OpsAlarmTopicArn
+        PrivateSubnetIds: !GetAtt Foundation.Outputs.PrivateSubnetIds
+        LambdaSecurityGroupId: !GetAtt Foundation.Outputs.LambdaSecurityGroupId
+        LogsKmsKeyArn: !GetAtt Foundation.Outputs.LogsKmsKeyArn
+        DynamoDbKmsAccessPolicyArn: !GetAtt Keys.Outputs.DynamoDbKmsAccessPolicyArn
+        # SQS CMK + use policy for this stack's queues (CKV_AWS_27 / cfn_nag W48).
+        SqsKmsKeyArn: !GetAtt Keys.Outputs.SqsKmsKeyArn
+        SqsKmsAccessPolicyArn: !GetAtt Keys.Outputs.SqsKmsAccessPolicyArn
+        UserExportBucketName: !GetAtt Foundation.Outputs.UserExportBucketName
+        UserExportBucketArn: !GetAtt Foundation.Outputs.UserExportBucketArn
+
+  EventsData:
+    Type: AWS::CloudFormation::Stack
+    Properties: { TemplateURL: !Sub "${TemplateBaseUrl}/service-events-data.yaml", Parameters: { Stage: !Ref Stage, DynamoDbKmsKeyArn: !GetAtt Keys.Outputs.DynamoDbKmsKeyArn } }
+  EventsApp:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/service-events-app.yaml"
+      Parameters:
+        Stage: !Ref Stage
+        RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
+        PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
+        RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
+        EventBusName: !GetAtt Foundation.Outputs.EventBusName
+        TableName: !GetAtt EventsData.Outputs.TableName
+        TableArn: !GetAtt EventsData.Outputs.TableArn
+        IdempotencyTableName: !GetAtt EventsData.Outputs.IdempotencyTableName
+        IdeasTableName: !GetAtt EventsData.Outputs.IdeasTableName
+        IdeasTableArn: !GetAtt EventsData.Outputs.IdeasTableArn
+        LibraryTableName: !GetAtt EventsData.Outputs.LibraryTableName
+        LibraryTableArn: !GetAtt EventsData.Outputs.LibraryTableArn
+        FileShareBucketName: !GetAtt Foundation.Outputs.FileShareBucketName
+        FileShareBucketArn: !GetAtt Foundation.Outputs.FileShareBucketArn
+        # MIGRATED to the private API (third service). Events has the most
+        # fan-out of any service so far — three clients (contributions, designee
+        # role, settings), all on a 1.5s budget with NO retry, and one of them
+        # comments "same measured NAT->API GW->Lambda floor". It was also the
+        # worst offender historically: 52 silent failures over 24-28 Aug on the
+        # PUBLIC path (36 settings-read, 15 contributions, 1 designee). The
+        # measured private path has a tighter tail (294ms max vs 598ms), so this
+        # should reduce those, and events now has alarms either way.
+        ApiBaseUrl: !GetAtt ApiEdge.Outputs.PrivateApiVpceUrl
+        # STAYS PUBLIC, deliberately. This is not a fan-out target: it is the
+        # base URL embedded in presigned upload links handed to EXTERNAL parties'
+        # browsers (US-2.21), which must resolve from the internet. Pointing it
+        # at the private API would mint links nobody outside the VPC can use.
+        PublicUploadBaseUrl: !GetAtt ApiEdge.Outputs.ApiEndpoint
+        EnableSemanticSearch: !Ref EnableSemanticSearch
+        OpsAlarmTopicArn: !GetAtt Foundation.Outputs.OpsAlarmTopicArn
+        PrivateSubnetIds: !GetAtt Foundation.Outputs.PrivateSubnetIds
+        LambdaSecurityGroupId: !GetAtt Foundation.Outputs.LambdaSecurityGroupId
+        LogsKmsKeyArn: !GetAtt Foundation.Outputs.LogsKmsKeyArn
+        DynamoDbKmsAccessPolicyArn: !GetAtt Keys.Outputs.DynamoDbKmsAccessPolicyArn
+
+  ForumsData:
+    Type: AWS::CloudFormation::Stack
+    Properties: { TemplateURL: !Sub "${TemplateBaseUrl}/service-forums-data.yaml", Parameters: { Stage: !Ref Stage, DynamoDbKmsKeyArn: !GetAtt Keys.Outputs.DynamoDbKmsKeyArn } }
+  ForumsApp:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/service-forums-app.yaml"
+      Parameters:
+        Stage: !Ref Stage
+        RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
+        PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
+        RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
+        EventBusName: !GetAtt Foundation.Outputs.EventBusName
+        TableName: !GetAtt ForumsData.Outputs.TableName
+        TableArn: !GetAtt ForumsData.Outputs.TableArn
+        IdempotencyTableName: !GetAtt ForumsData.Outputs.IdempotencyTableName
+        EnableSemanticSearch: !Ref EnableSemanticSearch
+        OpsAlarmTopicArn: !GetAtt Foundation.Outputs.OpsAlarmTopicArn
+        # MIGRATED to the private API. Forums and contributions-scoring share a
+        # functionally identical membership_client calling GET /groups/my-memberships,
+        # with the same failure mode, so they move together.
+        #
+        # This is the AUTHORISATION-relevant pair, and it was checked before
+        # moving: on failure the client returns None and the caller guards with
+        # `if live_groups is not None`, so principal.member_group_ids keeps its
+        # JWT value. None is never read as "unrestricted", and in forums the live
+        # lookup only runs when `group_ids is not None and role == "Member"`, so a
+        # failure cannot promote a Member to CommunityLeader scope. The exposure
+        # is a stale-membership window — a revoked member keeps group access until
+        # their token expires — which is pre-existing, by design, and independent
+        # of which API carries the lookup.
+        #
+        # Both were already failing on the PUBLIC path in the preserved logs:
+        # forums 49 times (26 read timeouts at 1.5s plus 23 401s) and
+        # contributions-scoring 55 times, over 24-27 Aug, entirely unalarmed.
+        ApiBaseUrl: !GetAtt ApiEdge.Outputs.PrivateApiVpceUrl
+        PrivateSubnetIds: !GetAtt Foundation.Outputs.PrivateSubnetIds
+        LambdaSecurityGroupId: !GetAtt Foundation.Outputs.LambdaSecurityGroupId
+        LogsKmsKeyArn: !GetAtt Foundation.Outputs.LogsKmsKeyArn
+        DynamoDbKmsAccessPolicyArn: !GetAtt Keys.Outputs.DynamoDbKmsAccessPolicyArn
+        # SQS CMK + use policy for this stack's queues (CKV_AWS_27 / cfn_nag W48).
+        SqsKmsKeyArn: !GetAtt Keys.Outputs.SqsKmsKeyArn
+        SqsKmsAccessPolicyArn: !GetAtt Keys.Outputs.SqsKmsAccessPolicyArn
+
+  CertificationsData:
+    Type: AWS::CloudFormation::Stack
+    Properties: { TemplateURL: !Sub "${TemplateBaseUrl}/service-certifications-data.yaml", Parameters: { Stage: !Ref Stage, DynamoDbKmsKeyArn: !GetAtt Keys.Outputs.DynamoDbKmsKeyArn } }
+  CertificationsApp:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/service-certifications-app.yaml"
+      Parameters:
+        Stage: !Ref Stage
+        RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
+        PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
+        RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
+        EventBusName: !GetAtt Foundation.Outputs.EventBusName
+        TableName: !GetAtt CertificationsData.Outputs.TableName
+        IdempotencyTableName: !GetAtt CertificationsData.Outputs.IdempotencyTableName
+        FileShareBucketName: !GetAtt Foundation.Outputs.FileShareBucketName
+        FileShareBucketArn: !GetAtt Foundation.Outputs.FileShareBucketArn
+        SpaBucketName: !GetAtt ApiEdge.Outputs.SpaBucketName
+        # MIGRATED to the private API (second service, after announcements).
+        # IdentityClient FAILS CLOSED — providers.py states "None here must become
+        # a 503 upstream" — so a fan-out failure surfaces as a visible 503/deny
+        # rather than as quietly wrong data. It also retries once (attempts=2),
+        # which is the mitigation announcements lacks: a cold target loses attempt
+        # one to the 1.5s timeout and attempt two then hits it warm.
+        ApiBaseUrl: !GetAtt ApiEdge.Outputs.PrivateApiVpceUrl
+        EnableSemanticSearch: !Ref EnableSemanticSearch
+        OpsAlarmTopicArn: !GetAtt Foundation.Outputs.OpsAlarmTopicArn
+        PrivateSubnetIds: !GetAtt Foundation.Outputs.PrivateSubnetIds
+        LambdaSecurityGroupId: !GetAtt Foundation.Outputs.LambdaSecurityGroupId
+        LogsKmsKeyArn: !GetAtt Foundation.Outputs.LogsKmsKeyArn
+        DynamoDbKmsAccessPolicyArn: !GetAtt Keys.Outputs.DynamoDbKmsAccessPolicyArn
+
+  ContributionsScoringData:
+    Type: AWS::CloudFormation::Stack
+    Properties: { TemplateURL: !Sub "${TemplateBaseUrl}/service-contributions-scoring-data.yaml", Parameters: { Stage: !Ref Stage, DynamoDbKmsKeyArn: !GetAtt Keys.Outputs.DynamoDbKmsKeyArn } }
+  ContributionsScoringApp:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/service-contributions-scoring-app.yaml"
+      Parameters:
+        Stage: !Ref Stage
+        RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
+        PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
+        RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
+        EventBusName: !GetAtt Foundation.Outputs.EventBusName
+        TableName: !GetAtt ContributionsScoringData.Outputs.TableName
+        StreamArn: !GetAtt ContributionsScoringData.Outputs.StreamArn
+        IdempotencyTableName: !GetAtt ContributionsScoringData.Outputs.IdempotencyTableName
+        OpsAlarmTopicArn: !GetAtt Foundation.Outputs.OpsAlarmTopicArn
+        # MIGRATED to the private API. Forums and contributions-scoring share a
+        # functionally identical membership_client calling GET /groups/my-memberships,
+        # with the same failure mode, so they move together.
+        #
+        # This is the AUTHORISATION-relevant pair, and it was checked before
+        # moving: on failure the client returns None and the caller guards with
+        # `if live_groups is not None`, so principal.member_group_ids keeps its
+        # JWT value. None is never read as "unrestricted", and in forums the live
+        # lookup only runs when `group_ids is not None and role == "Member"`, so a
+        # failure cannot promote a Member to CommunityLeader scope. The exposure
+        # is a stale-membership window — a revoked member keeps group access until
+        # their token expires — which is pre-existing, by design, and independent
+        # of which API carries the lookup.
+        #
+        # Both were already failing on the PUBLIC path in the preserved logs:
+        # forums 49 times (26 read timeouts at 1.5s plus 23 401s) and
+        # contributions-scoring 55 times, over 24-27 Aug, entirely unalarmed.
+        ApiBaseUrl: !GetAtt ApiEdge.Outputs.PrivateApiVpceUrl
+        PrivateSubnetIds: !GetAtt Foundation.Outputs.PrivateSubnetIds
+        LambdaSecurityGroupId: !GetAtt Foundation.Outputs.LambdaSecurityGroupId
+        LogsKmsKeyArn: !GetAtt Foundation.Outputs.LogsKmsKeyArn
+        DynamoDbKmsAccessPolicyArn: !GetAtt Keys.Outputs.DynamoDbKmsAccessPolicyArn
+        # SQS CMK + use policy for this stack's queues (CKV_AWS_27 / cfn_nag W48).
+        SqsKmsKeyArn: !GetAtt Keys.Outputs.SqsKmsKeyArn
+        SqsKmsAccessPolicyArn: !GetAtt Keys.Outputs.SqsKmsAccessPolicyArn
+        # Shared export bucket — this service writes Point Ledger CSVs under its
+        # own contributions/ prefix (identity-access uses users/ and groups/,
+        # member-profiles uses members/).
+        UserExportBucketName: !GetAtt Foundation.Outputs.UserExportBucketName
+        UserExportBucketArn: !GetAtt Foundation.Outputs.UserExportBucketArn
+
+  AnnouncementsData:
+    Type: AWS::CloudFormation::Stack
+    Properties: { TemplateURL: !Sub "${TemplateBaseUrl}/service-announcements-data.yaml", Parameters: { Stage: !Ref Stage, DynamoDbKmsKeyArn: !GetAtt Keys.Outputs.DynamoDbKmsKeyArn } }
+  AnnouncementsApp:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/service-announcements-app.yaml"
+      Parameters:
+        Stage: !Ref Stage
+        RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
+        PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
+        RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
+        EventBusName: !GetAtt Foundation.Outputs.EventBusName
+        TableName: !GetAtt AnnouncementsData.Outputs.TableName
+        TableArn: !GetAtt AnnouncementsData.Outputs.TableArn
+        IdempotencyTableName: !GetAtt AnnouncementsData.Outputs.IdempotencyTableName
+        # MIGRATED to the private API (first service to move). Announcements is
+        # the canary deliberately: its only fan-out is directory_client reading
+        # /members/*, so a failure degrades one enrichment rather than breaking
+        # authorisation, which is what forums and contributions-scoring do via
+        # /groups/my-memberships. The remaining services still point at
+        # ApiEdge.Outputs.ApiEndpoint and keep egressing through NAT until they
+        # are moved one at a time.
+        ApiBaseUrl: !GetAtt ApiEdge.Outputs.PrivateApiVpceUrl
+        OpsAlarmTopicArn: !GetAtt Foundation.Outputs.OpsAlarmTopicArn
+        PrivateSubnetIds: !GetAtt Foundation.Outputs.PrivateSubnetIds
+        LambdaSecurityGroupId: !GetAtt Foundation.Outputs.LambdaSecurityGroupId
+        LogsKmsKeyArn: !GetAtt Foundation.Outputs.LogsKmsKeyArn
+        DynamoDbKmsAccessPolicyArn: !GetAtt Keys.Outputs.DynamoDbKmsAccessPolicyArn
+        # SQS CMK + use policy for this stack's queues (CKV_AWS_27 / cfn_nag W48).
+        SqsKmsKeyArn: !GetAtt Keys.Outputs.SqsKmsKeyArn
+        SqsKmsAccessPolicyArn: !GetAtt Keys.Outputs.SqsKmsAccessPolicyArn
+
+  SettingsData:
+    Type: AWS::CloudFormation::Stack
+    Properties: { TemplateURL: !Sub "${TemplateBaseUrl}/service-settings-data.yaml", Parameters: { Stage: !Ref Stage, DynamoDbKmsKeyArn: !GetAtt Keys.Outputs.DynamoDbKmsKeyArn } }
+  SettingsApp:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/service-settings-app.yaml"
+      Parameters:
+        Stage: !Ref Stage
+        RestApiId: !GetAtt ApiEdge.Outputs.RestApiId
+        PrivateRestApiId: !GetAtt ApiEdge.Outputs.PrivateRestApiId
+        RootResourceId: !GetAtt ApiEdge.Outputs.RootResourceId
+        EventBusName: !GetAtt Foundation.Outputs.EventBusName
+        TableName: !GetAtt SettingsData.Outputs.TableName
+        IdempotencyTableName: !GetAtt SettingsData.Outputs.IdempotencyTableName
+        FileShareBucketName: !GetAtt Foundation.Outputs.FileShareBucketName
+        FileShareBucketArn: !GetAtt Foundation.Outputs.FileShareBucketArn
+        EnableSemanticSearch: !Ref EnableSemanticSearch
+        OpsAlarmTopicArn: !GetAtt Foundation.Outputs.OpsAlarmTopicArn
+        PrivateSubnetIds: !GetAtt Foundation.Outputs.PrivateSubnetIds
+        LambdaSecurityGroupId: !GetAtt Foundation.Outputs.LambdaSecurityGroupId
+        LogsKmsKeyArn: !GetAtt Foundation.Outputs.LogsKmsKeyArn
+        DynamoDbKmsAccessPolicyArn: !GetAtt Keys.Outputs.DynamoDbKmsAccessPolicyArn
+
+  # Seed runs last: uploads the built SPA + injects config.json (API + Cognito ids).
+  Seed:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - IdentityAccessApp
+      - MemberProfilesApp
+      - EventsApp
+      - ForumsApp
+      - CertificationsApp
+      - ContributionsScoringApp
+      - AnnouncementsApp
+      - SettingsApp
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/seed.yaml"
+      Parameters:
+        Stage: !Ref Stage
+        SpaBucketName: !GetAtt ApiEdge.Outputs.SpaBucketName
+        ApiEndpoint: !GetAtt ApiEdge.Outputs.ApiEndpoint
+        UserPoolId: !GetAtt Foundation.Outputs.UserPoolId
+        UserPoolClientId: !GetAtt Foundation.Outputs.UserPoolClientId
+        AdminEmail: !Ref AdminEmail
+        DistributionId: !GetAtt ApiEdge.Outputs.DistributionId
+        IdentityAccessTableName: !GetAtt IdentityAccessData.Outputs.TableName
+        # Scoring-framework seed (Unit 7 DL16) — default activities/points/tiers.
+        ContributionsTableName: !GetAtt ContributionsScoringData.Outputs.TableName
+        DeployNonce: !Ref DeployNonce
+        DynamoDbKmsAccessPolicyArn: !GetAtt Keys.Outputs.DynamoDbKmsAccessPolicyArn
+
+Outputs:
+  PortalUrl: { Value: !GetAtt ApiEdge.Outputs.DistributionDomain }
+  ApiEndpoint: { Value: !GetAtt ApiEdge.Outputs.ApiEndpoint }

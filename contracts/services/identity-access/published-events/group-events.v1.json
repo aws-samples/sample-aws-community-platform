@@ -1,0 +1,59 @@
+{
+  "title": "IdentityAccessGroupEvents",
+  "description": "Group + membership domain events (v1) carried in the platform event envelope 'data' field. Emitted to EventBridge after commit (BR-EV1). GroupHardDeleted triggers downstream purge (Forums/Contributions/Search).",
+  "oneOf": [
+    { "$ref": "#/definitions/GroupCreated" },
+    { "$ref": "#/definitions/GroupUpdated" },
+    { "$ref": "#/definitions/GroupSoftDeleted" },
+    { "$ref": "#/definitions/GroupRestored" },
+    { "$ref": "#/definitions/GroupHardDeleted" },
+    { "$ref": "#/definitions/MembershipChanged" }
+  ],
+  "definitions": {
+    "GroupCreated": {
+      "type": "object",
+      "required": ["groupId", "name", "approvalRequired", "leaderIds"],
+      "properties": {
+        "groupId": { "type": "string" },
+        "name": { "type": "string" },
+        "approvalRequired": { "type": "boolean" },
+        "leaderIds": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "GroupUpdated": {
+      "type": "object",
+      "required": ["groupId"],
+      "properties": {
+        "groupId": { "type": "string" },
+        "name": { "type": "string" },
+        "approvalRequired": { "type": "boolean" },
+        "leaderIds": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "GroupSoftDeleted": {
+      "type": "object",
+      "required": ["groupId", "effectiveAt"],
+      "properties": { "groupId": { "type": "string" }, "effectiveAt": { "type": "string" } }
+    },
+    "GroupRestored": {
+      "type": "object",
+      "required": ["groupId", "effectiveAt"],
+      "properties": { "groupId": { "type": "string" }, "effectiveAt": { "type": "string" } }
+    },
+    "GroupHardDeleted": {
+      "type": "object",
+      "required": ["groupId"],
+      "properties": { "groupId": { "type": "string" } }
+    },
+    "MembershipChanged": {
+      "type": "object",
+      "description": "MemberJoinedGroup | MemberLeftGroup | MemberRemoved (event 'type' in the envelope distinguishes them).",
+      "required": ["memberId", "groupId", "at"],
+      "properties": {
+        "memberId": { "type": "string" },
+        "groupId": { "type": "string" },
+        "at": { "type": "string" }
+      }
+    }
+  }
+}

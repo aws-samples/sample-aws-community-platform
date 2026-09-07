@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!--
+  SAMPLE MIRROR FEED — AWS Community Portal, Module 11 (What's New in AWS).
+
+  This is OUR mirror of the official AWS "Recent Announcements" feed, published to
+  S3 + CloudFront with CORS enabled so the SPA can fetch it directly from the browser
+  (US-11.7 stays client-side; no backend service).
+
+  Structure is deliberately identical to the upstream official feed
+  (https://aws.amazon.com/about-aws/whats-new/recent/feed/) with ONE normalization:
+  upstream packs its whole taxonomy into a SINGLE <category> element as a
+  comma-joined machine string, e.g.
+      <category>marketing:marchitecture/compute,general:products/amazon-ec2</category>
+  This mirror splits that into MULTIPLE <category> elements carrying human-readable
+  labels, which is what RSS 2.0 intends and what US-11.4 assumes. See
+  aidlc-docs/construction/plans/whats-new-brainstorming.md (Brainstorm 5).
+
+  All item content below is SAMPLE TEXT authored for this repository. It is not
+  copied from AWS. Titles and descriptions are representative, not real announcements.
+
+  Items are deliberately NOT in chronological order — the SPA must sort by <pubDate>
+  descending (US-11.3), and a pre-sorted fixture would hide a missing sort.
+
+  Edge cases intentionally present, so this doubles as a parser fixture:
+    - escaped-entity description (item 1) AND CDATA-wrapped description (item 2)
+    - newest item sitting in the middle of the document (item 3)
+    - item with NO <category> at all (item 5) - 8 of 100 upstream items have none
+    - very short description (item 6) and long multi-paragraph description (item 7)
+    - ampersands / entities in a title (item 8)
+    - item with no <pubDate> (item 9) - must not crash or silently vanish
+-->
+<rss version="2.0">
+  <channel>
+    <title>AWS What's New - Community Portal Mirror</title>
+    <link>https://aws.amazon.com/about-aws/whats-new/recent/</link>
+    <description>Mirror of recent AWS product and feature announcements, republished with CORS enabled for the AWS Community Portal.</description>
+    <managingEditor>community-portal@example.com (AWS Community Portal)</managingEditor>
+    <lastBuildDate>Mon, 10 Aug 2026 06:00:00 GMT</lastBuildDate>
+    <pubDate>Mon, 10 Aug 2026 06:00:00 GMT</pubDate>
+    <docs>http://blogs.law.harvard.edu/tech/rss</docs>
+    <language>en-US</language>
+
+    <!-- 1. Baseline item: HTML description via escaped entities, two categories. -->
+    <item>
+      <guid isPermaLink="false">sample-0001-ec2-r8i-additional-regions</guid>
+      <title>Amazon EC2 R8i instances are now available in additional Regions</title>
+      <link>https://aws.amazon.com/about-aws/whats-new/2026/08/aws-iot-core-influxdb/</link>
+      <pubDate>Fri, 07 Aug 2026 21:11:00 GMT</pubDate>
+      <category>Compute</category>
+      <category>Amazon EC2</category>
+      <author>community-portal@example.com</author>
+      <description>&lt;p&gt;Memory-optimized R8i instances are now available in three additional Regions. These instances suit in-memory databases, real-time analytics, and workloads that benefit from higher memory bandwidth.&lt;/p&gt;&lt;p&gt;To get started, see the &lt;a href="https://aws.amazon.com/ec2/"&gt;Amazon EC2 product page&lt;/a&gt; for Region availability and pricing.&lt;/p&gt;</description>
+    </item>
+
+    <!-- 2. Same shape, but description wrapped in CDATA instead of escaped. Real
+         feeds use both; a parser that only handles one will drop content. -->
+    <item>
+      <guid isPermaLink="false">sample-0002-lambda-ephemeral-storage</guid>
+      <title>AWS Lambda increases the maximum ephemeral storage per function</title>
+      <link>https://aws.amazon.com/about-aws/whats-new/2026/08/aws-iot-core-influxdb/</link>
+      <pubDate>Wed, 05 Aug 2026 16:40:00 GMT</pubDate>
+      <category>Compute</category>
+      <category>Serverless</category>
+      <category>AWS Lambda</category>
+      <author>community-portal@example.com</author>
+      <description><![CDATA[<p>Functions can now be configured with a larger <code>/tmp</code> allocation, which helps workloads that stage files during execution such as media processing and data transformation.</p><p>There is no additional charge to configure a larger allocation; you pay only for storage actually used. See the <a href="https://aws.amazon.com/lambda/">AWS Lambda</a> documentation to configure it.</p>]]></description>
+    </item>
+
+    <!-- 3. NEWEST item, placed mid-document on purpose. If the SPA renders document
+         order instead of sorting by pubDate, this lands in the wrong position. -->
+    <item>
+      <guid isPermaLink="false">sample-0003-bedrock-new-models</guid>
+      <title>Amazon Bedrock adds new foundation models for text and embeddings</title>
+      <link>https://aws.amazon.com/about-aws/whats-new/2026/08/aws-iot-core-influxdb/</link>
+      <pubDate>Sun, 09 Aug 2026 14:05:00 GMT</pubDate>
+      <category>Artificial Intelligence</category>
+      <category>Amazon Bedrock</category>
+      <author>community-portal@example.com</author>
+      <description>&lt;p&gt;Additional text-generation and embedding models are available through a single API, with the same request shape as existing models so switching requires only a model identifier change.&lt;/p&gt;&lt;p&gt;Availability varies by Region. Review the model catalog before enabling one in production.&lt;/p&gt;</description>
+    </item>
+
+    <!-- 4. Ordinary item, single paragraph. -->
+    <item>
+      <guid isPermaLink="false">sample-0004-dynamodb-on-demand-pricing</guid>
+      <title>Amazon DynamoDB reduces on-demand throughput pricing</title>
+      <link>https://aws.amazon.com/about-aws/whats-new/2026/08/aws-iot-core-influxdb/</link>
+      <pubDate>Sun, 02 Aug 2026 09:30:00 GMT</pubDate>
+      <category>Databases</category>
+      <category>Amazon DynamoDB</category>
+      <author>community-portal@example.com</author>
+      <description>&lt;p&gt;On-demand read and write request pricing is reduced in all commercial Regions. The change applies automatically with no action required, and appears on the next billing cycle.&lt;/p&gt;</description>
+    </item>
+
+    <!-- 5. NO <category> element at all. 8 of 100 upstream items look like this.
+         The category filter must not list a blank option, and this item must still
+         appear when no filter is applied. -->
+    <item>
+      <guid isPermaLink="false">sample-0005-support-console-refresh</guid>
+      <title>AWS Support Center console introduces a refreshed case experience</title>
+      <link>https://aws.amazon.com/about-aws/whats-new/2026/08/aws-iot-core-influxdb/</link>
+      <pubDate>Thu, 06 Aug 2026 11:20:00 GMT</pubDate>
+      <author>community-portal@example.com</author>
+      <description>&lt;p&gt;The case list and case detail views have been reorganized to surface correspondence and attachments more directly. No migration is required and existing cases are unaffected.&lt;/p&gt;</description>
+    </item>
+
+    <!-- 6. Very short description - shorter than the ~150 char summary truncation.
+         Truncation logic must not append an ellipsis when nothing was cut. -->
+    <item>
+      <guid isPermaLink="false">sample-0006-s3-express-regions</guid>
+      <title>Amazon S3 Express One Zone expands to additional Regions</title>
+      <link>https://aws.amazon.com/about-aws/whats-new/2026/08/aws-iot-core-influxdb/</link>
+      <pubDate>Sat, 08 Aug 2026 13:00:00 GMT</pubDate>
+      <category>Storage</category>
+      <category>Amazon S3</category>
+      <author>community-portal@example.com</author>
+      <description>&lt;p&gt;Now available in three additional Regions.&lt;/p&gt;</description>
+    </item>
+
+    <!-- 7. Long, multi-paragraph description with a list. Exercises the 150-char
+         summary truncation (US-11.3) against a much larger Details body (US-11.5),
+         and gives the sanitizer more than one tag family to allow-list. -->
+    <item>
+      <guid isPermaLink="false">sample-0007-opensearch-vector-performance</guid>
+      <title>Amazon OpenSearch Service improves vector search performance and reduces memory footprint</title>
+      <link>https://aws.amazon.com/about-aws/whats-new/2026/08/aws-iot-core-influxdb/</link>
+      <pubDate>Tue, 04 Aug 2026 08:15:00 GMT</pubDate>
+      <category>Analytics</category>
+      <category>Machine Learning</category>
+      <category>Amazon OpenSearch Service</category>
+      <author>community-portal@example.com</author>
+      <description><![CDATA[<p>Vector search now uses a revised index layout that lowers the memory required to serve approximate nearest-neighbour queries at a given recall target. Benchmarks on high-dimensional embedding workloads show reduced resident memory with comparable recall.</p><p>The improvement is most noticeable for collections where the vector index previously did not fit in memory and queries spilled to disk. Specific gains depend on dimensionality, dataset size, and the recall target configured for the index.</p><p>Key points:</p><ul><li>No change to the query API - existing k-NN queries work unmodified.</li><li>Existing indexes continue to serve traffic during migration.</li><li>Re-indexing is optional but recommended to realize the full benefit.</li></ul><p>See the <a href="https://aws.amazon.com/opensearch-service/">Amazon OpenSearch Service</a> documentation for migration guidance.</p>]]></description>
+    </item>
+
+    <!-- 8. Ampersand and entities in the title and in a category label. A parser
+         that hand-rolls string splitting instead of parsing XML tends to mangle these. -->
+    <item>
+      <guid isPermaLink="false">sample-0008-iam-condition-keys</guid>
+      <title>AWS Identity &amp; Access Management adds new condition keys for tag-based access control</title>
+      <link>https://aws.amazon.com/about-aws/whats-new/2026/08/aws-iot-core-influxdb/</link>
+      <pubDate>Mon, 03 Aug 2026 17:45:00 GMT</pubDate>
+      <category>Security, Identity &amp; Compliance</category>
+      <category>AWS Identity &amp; Access Management</category>
+      <author>community-portal@example.com</author>
+      <description>&lt;p&gt;New condition keys let you write policies that compare resource tags against principal tags, so a single policy can cover teams that own separately tagged resources.&lt;/p&gt;&lt;p&gt;Existing policies continue to evaluate unchanged. Review the condition key reference before adopting them in a permissions boundary.&lt;/p&gt;</description>
+    </item>
+
+    <!-- 9. NO <pubDate>. Undated items must not crash the sort, and must not silently
+         disappear - decide deliberately whether they sort last or are dropped. -->
+    <item>
+      <guid isPermaLink="false">sample-0009-undated-item</guid>
+      <title>Amazon CloudWatch adds a metrics explorer saved-view shortcut</title>
+      <link>https://aws.amazon.com/about-aws/whats-new/2026/08/aws-iot-core-influxdb/</link>
+      <category>Management &amp; Governance</category>
+      <category>Amazon CloudWatch</category>
+      <author>community-portal@example.com</author>
+      <description>&lt;p&gt;Saved views can now be opened directly from the metrics explorer toolbar. This sample item deliberately carries no pubDate.&lt;/p&gt;</description>
+    </item>
+  </channel>
+</rss>

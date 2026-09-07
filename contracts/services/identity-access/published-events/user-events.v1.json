@@ -1,0 +1,48 @@
+{
+  "title": "IdentityAccessUserEvents",
+  "description": "User domain events (v1) carried in the platform event envelope 'data' field. Emitted to EventBridge after the primary write commits (BR-EV1). Consumers are idempotent on the envelope id.",
+  "oneOf": [
+    { "$ref": "#/definitions/UserProvisioned" },
+    { "$ref": "#/definitions/UserRoleChanged" },
+    { "$ref": "#/definitions/UserDeactivated" },
+    { "$ref": "#/definitions/UserReactivated" }
+  ],
+  "definitions": {
+    "UserProvisioned": {
+      "type": "object",
+      "required": ["userId", "email", "role", "source"],
+      "properties": {
+        "userId": { "type": "string" },
+        "email": { "type": "string" },
+        "firstName": { "type": "string" },
+        "lastName": { "type": "string" },
+        "role": { "type": "string", "enum": ["Administrator", "CommunityLeader", "UserGroupLeader", "Member"] },
+        "source": { "type": "string", "enum": ["jit", "import", "sync"] },
+        "city": { "type": ["string", "null"], "description": "Optional profile column captured at admin-create / bulk-import; seeds the Member-Profiles record." },
+        "country": { "type": ["string", "null"] },
+        "professionalRole": { "type": ["string", "null"] },
+        "awsProject": { "type": "boolean" },
+        "timeZone": { "type": ["string", "null"] }
+      }
+    },
+    "UserRoleChanged": {
+      "type": "object",
+      "required": ["userId", "oldRole", "newRole"],
+      "properties": {
+        "userId": { "type": "string" },
+        "oldRole": { "type": "string" },
+        "newRole": { "type": "string" }
+      }
+    },
+    "UserDeactivated": {
+      "type": "object",
+      "required": ["userId"],
+      "properties": { "userId": { "type": "string" } }
+    },
+    "UserReactivated": {
+      "type": "object",
+      "required": ["userId"],
+      "properties": { "userId": { "type": "string" } }
+    }
+  }
+}

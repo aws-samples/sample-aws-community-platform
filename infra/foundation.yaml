@@ -1,0 +1,1604 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Community Portal — Foundation stack. VPC (2 AZ), NAT, gateway VPC endpoints
+  (S3, DynamoDB), Cognito user pool, EventBridge bus, observability baseline.
+  Outputs are passed as Parameters to service stacks (no Fn::ImportValue).
+
+Parameters:
+  Stage: { Type: String, Default: dev, AllowedValues: [dev, prod] }
+  OpsEmail: { Type: String, Description: Email subscribed to ops/security alarms }
+  LogRetentionDays: { Type: Number, Default: 30 }
+  # From the keys stack. The DynamoDB CMK lives there rather than here to break a
+  # dependency cycle — see the note at the top of infra/keys.yaml.
+  DynamoDbKmsAccessPolicyArn: { Type: String }
+  # The GENERATED identity-access table name, from IdentityAccessData.
+  #
+  # This used to be built here as !Sub "identity-access-${Stage}", which is what
+  # forced the table to carry an explicit TableName (cfn_nag W28). It is now passed
+  # in so the table can take a CloudFormation-generated name. TokenClaimsFunction
+  # is the only consumer: it is a Cognito PreTokenGeneration trigger, so it cannot
+  # move to the identity-access stack, which is why the value has to come to it.
+  IdentityAccessTableName: { Type: String }
+
+# NatPerAz / MultiNat are gone with the NAT Gateways (2026-08-30). They existed to
+# choose between one NAT and one-per-AZ; with no NAT at all there is nothing to
+# choose. Removing the parameter is deliberate rather than leaving it inert: a
+# leftover NatPerAz=true would silently do nothing, which is worse than failing.
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Project, Value: community-portal }, { Key: Stage, Value: !Ref Stage }]
+
+  # PublicSubnetA (10.20.0.0/20) and PublicSubnetB (10.20.16.0/20) were DELETED on
+  # 2026-08-30 with the NAT Gateways and Internet Gateway. They only ever hosted
+  # NAT ENIs — B was empty even before removal — and were never exported as
+  # Outputs, so nothing outside this template referenced them.
+  #
+  # This VPC now has NO PATH TO OR FROM THE INTERNET. Every AWS API call leaves
+  # through a VPC endpoint; every service-to-service call goes through the private
+  # API Gateway on the execute-api endpoint. Adding anything that needs internet
+  # egress is therefore a design change, not a config tweak: it needs an interface
+  # endpoint (see the endpoint block below), or it does not belong in this VPC.
+  #
+  # The two CIDRs are left unallocated rather than reused, so the address plan
+  # still reads the way the diagrams and runbooks describe it.
+  # MapPublicIpOnLaunch is stated EXPLICITLY on both subnets rather than left
+  # to the default (SUBNET_AUTO_ASSIGN_PUBLIC_IP_DISABLED / cfn_nag W33).
+  #
+  # The default for a subnet in a non-default VPC is already false, so this
+  # changes no behaviour — it makes the intent readable to a static scanner,
+  # which cannot distinguish "absent" from "absent and deliberate". Removing NAT
+  # and the IGW did NOT clear this finding and was never going to: the rule reads
+  # a subnet attribute, not the routing around it.
+  # ───────────────────────────────────────────────────────────────────────────
+  # PORTABLE AVAILABILITY-ZONE SELECTION.
+  #
+  # The subnet AZs used to be chosen by POSITION — !Select [0|1|2, !GetAZs ''] —
+  # which silently assumes that index maps to an AZ offering every interface
+  # endpoint this stack creates. That assumption is ACCOUNT-SPECIFIC and wrong in
+  # the general case: AWS maps the AZ *names* (us-east-1a, 1b, ...) to different
+  # PHYSICAL AZs per account, and interface-endpoint services (notably
+  # cognito-idp) are only offered in a subset of them. Deploying into a fresh
+  # account put the Cognito endpoint's subnet on an unsupported AZ and rolled the
+  # whole root stack back mid-create with:
+  #   "the VPC endpoint service com.amazonaws.us-east-1.cognito-idp does not
+  #    support the availability zone of the subnet: subnet-xxxx"
+  # — a cryptic, deep-in-a-nested-stack failure every customer would have to
+  # debug by hand.
+  #
+  # AzSelector removes the guess. It asks EC2 which AZs actually offer ALL the
+  # interface-endpoint services this stack creates, in THIS account/region, and
+  # returns the first two (sorted, for determinism). Both subnets AND every
+  # interface endpoint are then placed only in AZs known to work, so the template
+  # deploys unchanged into any account that offers these services in >= 2 AZs —
+  # and fails FAST with an explicit reason if it does not, instead of halfway
+  # through the create.
+  #
+  # This is also why the old third subnet (EndpointSubnetC) is GONE. It existed
+  # only because cognito-idp was unavailable in the AZ PrivateSubnetA happened to
+  # land in, so the Cognito endpoint needed a different pair of AZs (B + C) than
+  # everything else. With A and B now guaranteed to support cognito-idp, the
+  # Cognito endpoint uses A + B like every other endpoint and the special-case
+  # subnet is unnecessary.
+  #
+  # The selector Lambda runs OUTSIDE the VPC (no VpcConfig): it needs to reach
+  # the EC2 control plane and the CloudFormation response URL, and this VPC has
+  # no internet path. Same placement as the seed custom resources (infra/seed.yaml).
+  AzSelectorFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "CloudFormation custom resource — runs only during stack operations and must reach the EC2 control plane + CFN response URL; VPC placement (which has no internet path) would break it"
+          - id: W92
+            reason: "One-shot CloudFormation custom resource — reserved concurrency not applicable"
+    Properties:
+      FunctionName: !Sub "community-portal-az-selector-${Stage}"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      # ec2:DescribeVpcEndpointServices has NO resource-level scoping (it is an
+      # account-wide describe), so Resource must be "*". It is read-only and
+      # returns no customer data.
+      Policies:
+        - Statement:
+            - Sid: DescribeEndpointServices
+              Effect: Allow
+              Action: ec2:DescribeVpcEndpointServices
+              Resource: "*"
+      InlineCode: |
+        import json
+        import urllib.request
+        import boto3
+
+
+        def _respond(event, context, status, data=None, reason=None):
+            payload = json.dumps({
+                "Status": status,
+                "Reason": reason or ("see log stream " + context.log_stream_name),
+                "PhysicalResourceId": "az-selector",
+                "StackId": event["StackId"],
+                "RequestId": event["RequestId"],
+                "LogicalResourceId": event["LogicalResourceId"],
+                "Data": data or {},
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                event["ResponseURL"],
+                data=payload,
+                method="PUT",
+                headers={"content-type": "", "content-length": str(len(payload))},
+            )
+            urllib.request.urlopen(req)
+
+
+        def handler(event, context):
+            try:
+                if event["RequestType"] == "Delete":
+                    _respond(event, context, "SUCCESS")
+                    return
+                props = event["ResourceProperties"]
+                services = props["ServiceNames"]
+                count = int(props.get("Count", "2"))
+                ec2 = boto3.client("ec2")
+                common = None
+                per_service = {}
+                for name in services:
+                    details = ec2.describe_vpc_endpoint_services(
+                        ServiceNames=[name])["ServiceDetails"]
+                    if not details:
+                        raise RuntimeError("endpoint service not found: " + name)
+                    azs = set(details[0]["AvailabilityZones"])
+                    per_service[name] = sorted(azs)
+                    common = azs if common is None else (common & azs)
+                chosen = sorted(common or [])
+                if len(chosen) < count:
+                    _respond(event, context, "FAILED", reason=(
+                        "only %d AZ(s) support all endpoint services (need %d): "
+                        "%s; per-service: %s" % (
+                            len(chosen), count, chosen, per_service)))
+                    return
+                data = {"Az%d" % i: chosen[i] for i in range(count)}
+                data["Chosen"] = ",".join(chosen[:count])
+                _respond(event, context, "SUCCESS", data=data)
+            except Exception as exc:  # noqa: BLE001
+                _respond(event, context, "FAILED", reason=str(exc))
+
+  # Discovers AZs that support ALL interface-endpoint services created below.
+  # The service names are the SAME ones the VPCEndpoint resources use, kept in
+  # sync by construction (com.amazonaws.<region>.<svc>). If an endpoint is added
+  # or removed below, update this list so its AZ requirement is accounted for.
+  # NOTE: the condition-gated OpenSearch Serverless (aoss) endpoint is NOT listed
+  # — it is only created when EnableSemanticSearch=true; if that is enabled in a
+  # region where aoss is offered in fewer AZs than these services, add it here.
+  AzSelector:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt AzSelectorFunction.Arn
+      Count: "2"
+      ServiceNames:
+        - !Sub "com.amazonaws.${AWS::Region}.events"
+        - !Sub "com.amazonaws.${AWS::Region}.lambda"
+        - !Sub "com.amazonaws.${AWS::Region}.cognito-idp"
+        - !Sub "com.amazonaws.${AWS::Region}.email"
+        - !Sub "com.amazonaws.${AWS::Region}.monitoring"
+        - !Sub "com.amazonaws.${AWS::Region}.ssm"
+        - !Sub "com.amazonaws.${AWS::Region}.states"
+        - !Sub "com.amazonaws.${AWS::Region}.execute-api"
+
+  # Both subnets take their AZ from AzSelector, so they land only on AZs that
+  # support every interface endpoint. The !GetAtt also makes each subnet depend
+  # on the selector implicitly — no explicit DependsOn needed.
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties: { VpcId: !Ref Vpc, CidrBlock: 10.20.32.0/20, AvailabilityZone: !GetAtt AzSelector.Az0, MapPublicIpOnLaunch: false }
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties: { VpcId: !Ref Vpc, CidrBlock: 10.20.48.0/20, AvailabilityZone: !GetAtt AzSelector.Az1, MapPublicIpOnLaunch: false }
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # NO INTERNET GATEWAY. NO NAT GATEWAY. Deleted 2026-08-30.
+  #
+  # Previously: Igw + IgwAttach, NatEipA + NatGatewayA (and a conditional
+  # NatEipB/NatGatewayB for NatPerAz=true, never created in either account),
+  # PublicRouteTable + PublicRoute (0.0.0.0/0 -> Igw), and the private default
+  # routes (0.0.0.0/0 -> NatGatewayA). Removed because appsec clearance requires
+  # a VPC with no internet path, not merely one that does not use it.
+  #
+  # Evidence gathered before removal, not after:
+  #   * Every boto3 client constructed anywhere under services/*/src and platform/
+  #     was enumerated and matched to an endpoint below. The list is derived from
+  #     the code because getting it wrong is not a deploy error — the call simply
+  #     starts timing out.
+  #   * A real nightly-jobs batch (6/6 jobs, 25,003 documents reindexed, 24,999
+  #     members counted) ran with 0 bytes of NAT egress, 0 packets, 0 connection
+  #     attempts. An earlier "0 bytes at 03:00" reading was discarded as
+  #     worthless: the cron was failing in 0s at the time, so it measured nothing.
+  #   * Flow logs (traffic-path) accounted for every byte leaving a function ENI:
+  #     13.65 MB to DynamoDB via the GATEWAY endpoint (path 7, never touches a
+  #     NAT) and 2.7 KB to the EDGE-optimized public API. Zero via path 8.
+  #   * An in-VPC probe reached all 11 endpoints, including ssm, secretsmanager
+  #     and email, which no observed workload had exercised. (That probe is a
+  #     record of the state at the time: the secretsmanager endpoint has since
+  #     been removed along with the last Secrets Manager call site, leaving 10.
+  #     Its reachability was never evidence that anything needed it.)
+  #
+  # Known and accepted consequence: direct API calls to `logs`, `xray` and
+  # `cloudfront` from inside this VPC no longer work. Nothing does that — no code
+  # constructs a logs or xray client, Lambda delivers logs and traces out-of-band
+  # rather than over the function ENI, and CloudFront's only caller
+  # (platform/seed/spa_deploy_handler.py) runs outside the VPC.
+  #
+  # Also removed: an EIP that was being continuously port-scanned from the
+  # internet (22, 23, 80, 5060, 8080, 8443 and a spread of high ports, visible in
+  # the flow logs as inbound to the NAT ENI).
+  # ───────────────────────────────────────────────────────────────────────────
+
+  # Gateway VPC endpoints (free) for high-traffic data plane (AC-4).
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      # Single private route table now that MultiNat is gone. This association is
+      # what makes the gateway endpoint work at all, so it must survive the NAT
+      # removal: the route table stays, only its 0.0.0.0/0 -> NAT route went.
+      RouteTableIds: [!Ref PrivateRouteTable]
+  DynamoDbEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      VpcEndpointType: Gateway
+      # Single private route table now that MultiNat is gone. This association is
+      # what makes the gateway endpoint work at all, so it must survive the NAT
+      # removal: the route table stays, only its 0.0.0.0/0 -> NAT route went.
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Interface VPC endpoints (AWS PrivateLink).
+  #
+  # These exist to remove the NAT Gateways and the IGW, which is an appsec
+  # requirement. Today every AWS API call from a VPC Lambda egresses through NAT
+  # to a public endpoint; each endpoint below replaces one of those paths with
+  # private connectivity that never leaves the AWS network.
+  #
+  # The service list is DERIVED from the code, not guessed: every
+  # boto3.client(...)/resource(...) constructed under services/*/src and
+  # platform/. Getting it wrong is not a deploy-time error — the call simply
+  # starts timing out once NAT is gone.
+  #
+  #   events         EventBridge, 8 call sites (domain event publishing)
+  #   lambda         5 call sites (async invoke)
+  #   cognito-idp    4 call sites, LOGIN PATH — placed in A + B; AzSelector
+  #                  guarantees both AZs offer this service (see AzSelector above)
+  #   email          SES, identity-access/providers.py:83 — OTP email.
+  #                  The `email` (API) service, NOT `email-smtp`: the code uses
+  #                  boto3.client("ses"), and email-smtp is unavailable in
+  #                  us-east-1b anyway.
+  #   monitoring     CloudWatch, 3 call sites (PutMetricData)
+  #   ssm            9 call sites
+  #   states         Step Functions, settings JobsStateMachine
+  #   execute-api    the service-to-service fan-out. Also what the PRIVATE API
+  #                  Gateway will be attached to in the next phase.
+  #
+  # PrivateDnsEnabled on every one, which is what makes this a zero-code-change
+  # migration: boto3 keeps calling e.g. events.us-east-1.amazonaws.com and
+  # Route 53 resolves it to the endpoint ENI inside the VPC.
+  #
+  # DELIBERATELY NOT INCLUDED:
+  #   secretsmanager — REMOVED, not merely absent. The only Secrets Manager call
+  #     site in the whole codebase was platform/seed/seed_handler.py's
+  #     _persist_secret, recording the bootstrap admin's password; that secret is
+  #     gone (see infra/seed.yaml) and the seeder never ran in the VPC anyway
+  #     (seed.yaml declares no VpcConfig, hence its W89 suppression), so this
+  #     endpoint carried zero traffic even before the change. What remains is the
+  #     unused `secret()` helper in each service's _conventions/config.py —
+  #     scaffolding boilerplate with no callers. Re-add the endpoint if any
+  #     service ever starts calling it FROM the VPC; a missing interface endpoint
+  #     is not a deploy error, the call just times out.
+  #   logs, xray — a VPC Lambda's own log and trace delivery is handled by the
+  #     Lambda service out-of-band, not over the function's ENI, so no endpoint
+  #     is needed. No code constructs a `logs` or `xray` client either. Phase 5
+  #     flow logs will confirm this rather than leaving it as an assumption;
+  #     both are cheap to add if traffic shows up.
+  #   sts — no assume_role anywhere; Lambda credentials arrive in the execution
+  #     environment without an STS call.
+  #   cloudfront — no interface endpoint exists for it (global service). Its only
+  #     caller, platform/seed/spa_deploy_handler.py, runs OUTSIDE the VPC
+  #     (infra/seed.yaml declares no VpcConfig), so it is unaffected.
+  # S3 and DynamoDB are already covered by the free Gateway endpoints above.
+  # OpenSearch Serverless is already VPC-native via its own endpoint.
+  # ───────────────────────────────────────────────────────────────────────────
+
+  # A dedicated SG rather than reusing LambdaSecurityGroup (which is what the
+  # AOSS endpoint does via a self-referencing rule). Reusing it would mean the
+  # 443 self-ingress also permits Lambda-to-Lambda traffic, which nothing needs;
+  # a separate group states the intent — endpoints accept HTTPS from Lambdas and
+  # nothing else — and makes it auditable, which is the point of the exercise.
+  # ───────────────────────────────────────────────────────────────────────────
+  # THE VPC'S DEFAULT SECURITY GROUP IS NOT MANAGED HERE, AND THAT IS A GAP.
+  #
+  # AWS creates it with the VPC and CloudFormation has no resource type for it, so
+  # it ships with its stock rules: all traffic from itself, and ALL egress to
+  # 0.0.0.0/0. Nothing in this stack uses it (0 ENIs), but appsec and CIS both
+  # expect a default SG that permits no traffic, so that anything accidentally
+  # launched without an explicit group is isolated rather than handed open egress.
+  #
+  # Both rules were REVOKED BY HAND on 2026-08-30:
+  #   aws ec2 revoke-security-group-ingress --group-id <default-sg> --ip-permissions ...
+  #   aws ec2 revoke-security-group-egress  --group-id <default-sg> --ip-permissions ...
+  #
+  # This creates no CloudFormation drift, because CFN never owned those rules. It
+  # WILL NOT REPRODUCE IN A FRESH ACCOUNT: deploy this template somewhere new and
+  # the default SG comes back wide open. Making it durable needs a custom resource
+  # (the platform/seed pattern would fit) and is deliberately not done yet — it is
+  # recorded here rather than left for the next appsec scan to rediscover.
+  # ───────────────────────────────────────────────────────────────────────────
+
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface VPC endpoints - HTTPS in from Lambda functions only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: HTTPS from Lambda functions in this VPC
+      # EXPLICIT no-egress. Omitting SecurityGroupEgress does NOT create a group
+      # with no egress: EC2 substitutes an allow-all 0.0.0.0/0 rule. This group
+      # really did have `ALL -> 0.0.0.0/0` while carrying a comment asserting that
+      # "egress is intentionally absent" -- the premise was right (an interface
+      # endpoint ENI only answers inbound API calls, it never initiates traffic)
+      # but the conclusion was the opposite of the truth, so the least restricted
+      # group in the VPC read as the most locked down. That is what cfn_nag F1000
+      # reports: "missing egress rule means all traffic is allowed outbound".
+      #
+      # The old comment sat under a suppression for W29, which is about egress
+      # rules using PORT RANGES -- the wrong rule id, so it suppressed nothing and
+      # F1000 fired anyway. Both are gone: with an explicit rule there is nothing
+      # to suppress. (Same class of mistake as `# noqa: S310` being used where
+      # bandit needs `# nosec B310`.)
+      #
+      # 127.0.0.1/32 is the idiom for "no egress" -- CloudFormation cannot express
+      # an empty egress list, and loopback is unreachable from an ENI.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+          Description: No egress required - endpoint ENIs never initiate traffic
+      Tags:
+        - { Key: Project, Value: community-portal }
+        - { Key: Stage, Value: !Ref Stage }
+
+  EventsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.events"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
+
+  LambdaEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.lambda"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
+
+  # PrivateSubnetA + PrivateSubnetB, like every other endpoint. cognito-idp used
+  # to be a special case (it was unavailable in the AZ PrivateSubnetA landed on,
+  # forcing a third subnet), but AzSelector now guarantees BOTH A and B are in
+  # AZs that offer cognito-idp — it is one of the services AzSelector intersects
+  # over — so the login path is multi-AZ here without any special handling.
+  CognitoIdpEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.cognito-idp"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
+
+  SesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.email"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
+
+  CloudWatchEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.monitoring"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
+
+  StepFunctionsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.states"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
+
+  # Carries the service-to-service fan-out once it is repointed off the public
+  # API. Created now, ahead of the private API Gateway, so the endpoint id can be
+  # passed into the API Edge stack in the next phase.
+  #
+  # PrivateDnsEnabled MUST STAY false until the fan-out is repointed. This is not
+  # caution, it is a measured result: it was first written as `true`, and that
+  # BROKE every fan-out call the moment it deployed.
+  #
+  # Why: private DNS puts a private hosted zone for
+  # execute-api.<region>.amazonaws.com in front of the whole VPC, so EVERY API
+  # Gateway hostname resolves to this endpoint — including the PUBLIC (regional)
+  # API that API_BASE_URL still points at. An execute-api endpoint only serves
+  # PRIVATE APIs, so it answered those requests with 403 Forbidden.
+  #
+  # It failed silently, which is what makes it dangerous: fan_out_client swallows
+  # the error and returns None, so callers got HTTP 200 with fields quietly
+  # missing. Confirmed by the API Gateway access log containing NO entry for the
+  # requests at all — the endpoint rejected them before API Gateway ever saw
+  # them — while member-profiles logged "fan-out call failed (degrading
+  # gracefully) ... HTTP Error 403: Forbidden" for contributions, events,
+  # certifications and forums.
+  #
+  # With private DNS off, the endpoint exists and is ready for the private API,
+  # while public API hostnames keep resolving publicly and the fan-out keeps
+  # working over NAT. It gets switched on in the phase that repoints API_BASE_URL
+  # to the private API, once nothing in the VPC needs to reach a public one.
+  ExecuteApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.execute-api"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: false
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref VpcEndpointSecurityGroup]
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # CloudWatch Logs encryption key (cfn_nag W84 / Checkov CKV_AWS_158).
+  #
+  # ONE customer-managed key for all 13 log groups in the estate. AWS recommends
+  # a separate key per log group so the encryption context can be pinned to a
+  # single ARN; with rotation enabled that is 13 keys trending to ~$3/month each
+  # (see the rotation note below), so this deliberately trades the tighter
+  # scoping for one key plus a prefix-scoped condition. Revisit if a log group
+  # ever holds data with a different access-control requirement from the rest.
+  #
+  # This REPLACES the previous position, recorded in .cfn_nag_suppress.yaml, that
+  # "AWS-managed log group encryption is sufficient". That rationale was also
+  # factually wrong: omitting KmsKeyId does not select an AWS-managed KMS key,
+  # it means the data is not encrypted with KMS at all (there is no
+  # alias/aws/logs). CloudWatch Logs still encrypts server-side, but that is a
+  # different control from the one the comment claimed.
+  #
+  # OPERATIONAL RISK this introduces, which did not exist before: if this key is
+  # disabled or scheduled for deletion, CloudWatch Logs CANNOT WRITE to any of
+  # these groups and ingestion fails with InvalidParameterException. That
+  # includes the 365-day audit group. Do not disable it to "test" anything.
+  #
+  # Retain on delete/replace so tearing down this stack cannot leave log data
+  # that outlives its key and is therefore permanently unreadable. The cost is an
+  # orphaned key after a stack delete (see rotation pricing below), which is the
+  # cheaper mistake.
+  LogsKmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "CloudWatch Logs encryption — community-portal-${Stage}"
+      # RotationPeriodInDays is deliberately UNSET, which means the 365-day
+      # default. Reviewed and kept at 365 on 2026-08-31.
+      #
+      # Rotation is transparent to everything downstream: it replaces only the key
+      # MATERIAL, while the key ARN/id/alias stay constant, so the KmsKeyId
+      # association on all 13 log groups never needs updating. KMS retains every
+      # previous material version until the key itself is deleted and picks the
+      # right one on decrypt, so older log events stay readable across rotations.
+      #
+      # What it does NOT do, so nobody mistakes this for more than it is: it does
+      # not re-encrypt existing data, and it does not rotate the data keys that
+      # actually encrypt log events. This key is a WRAPPING key, so the key-
+      # exhaustion argument for rotating data keys does not apply to it. It is
+      # enabled because compliance baselines check for it, not because the threat
+      # model here demands it.
+      #
+      # PRICING: rotation is not free. AWS bills an extra monthly fee for the
+      # first and second rotation of key material, capped after the second — so
+      # this key costs ~$1/month now and trends to ~$3/month after two years.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: 'kms:*'
+            Resource: '*'
+          # The service principal is REGIONAL (logs.<region>.amazonaws.com), not
+          # logs.amazonaws.com. Getting this wrong fails the log-group update
+          # rather than failing open.
+          #
+          # ArnLike with wildcards, NOT ArnEquals with the real log-group ARNs,
+          # and that is load-bearing: this key lives in the foundation stack
+          # while 11 of the 13 log groups live in nested stacks that are ordered
+          # AFTER it. Naming their ARNs here would make foundation depend on its
+          # own consumers — a dependency cycle CloudFormation cannot resolve.
+          # Wildcards break the cycle, and foundation-runs-first guarantees the
+          # policy is in place before any group tries to use it.
+          #
+          # /aws/lambda/* is the loose pattern: it admits any Lambda log group in
+          # the account, not only this portal's nine. Enumerating the exact names
+          # would be tighter but silently breaks the next service somebody adds,
+          # so the wildcard is the deliberate choice.
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal: { Service: !Sub "logs.${AWS::Region}.amazonaws.com" }
+            Action: [kms:Encrypt, kms:Decrypt, 'kms:ReEncrypt*', 'kms:GenerateDataKey*', 'kms:Describe*']
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn':
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/apigw/community-portal-*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/portal/audit/*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/vpc/flowlogs/community-portal-*"
+      Tags: [{ Key: Project, Value: community-portal }, { Key: Stage, Value: !Ref Stage }]
+  LogsKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/community-portal-logs-${Stage}"
+      TargetKeyId: !Ref LogsKmsKey
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # VPC flow logs.
+  #
+  # Previously suppressed as "deferred to production readiness review"
+  # (.cfn_nag_suppress.yaml W19/W60, now removed). They are enabled here because
+  # they are the EVIDENCE BASE for deleting the NAT Gateways: before removing
+  # them we have to show that nothing still egresses through them, and the only
+  # way to show that is to watch. Deleting NAT on the strength of "we think we
+  # covered every service" is how a nightly job silently stops running.
+  #
+  # Custom format rather than the default. pkt-dstaddr is the field that matters:
+  # for NAT-bound traffic dstaddr is the NAT ENI, while pkt-dstaddr is the real
+  # destination, which is what identifies WHICH service call is still leaving the
+  # VPC. traffic-path distinguishes egress via NAT/IGW from traffic that stayed
+  # inside the VPC or went through a Gateway endpoint.
+  # The W84 suppression that used to sit here is GONE, not moved: the group now
+  # carries a real CMK, so there is nothing left to suppress.
+  VpcFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/vpc/flowlogs/community-portal-${Stage}"
+      # 30 days is comfortably longer than the observation window needed to prove
+      # NAT is idle, including a full cycle of the nightly scheduled jobs.
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
+
+  VpcFlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: vpc-flow-logs.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref VpcFlowLogDeliveryPolicy
+
+  # The grant is a customer-managed policy rather than an inline `Policies` list
+  # on the role above, because cfn-guard IAM_NO_INLINE_POLICY_CHECK (and its
+  # runtime twin, AWS Config iam-no-inline-policy-check) reject any inline policy
+  # on an IAM role regardless of how narrow it is. The permissions are identical
+  # to the inline version this replaced.
+  #
+  # ATTACHED VIA THE ROLE'S ManagedPolicyArns, NOT THIS POLICY'S `Roles` LIST.
+  # That direction matters: ManagedPolicyArns makes the attachment part of the
+  # role's own creation, so the role is permissioned by the time it reaches
+  # CREATE_COMPLETE and anything waiting on !GetAtt VpcFlowLogRole.Arn sees a
+  # working role — the same ordering the inline policy gave for free. A `Roles`
+  # list here would attach afterwards, leaving a window where the role exists
+  # with no permissions.
+  VpcFlowLogDeliveryPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      # ManagedPolicyName deliberately NOT set: an explicit name triggers cfn_nag
+      # W28, and nothing needs a predictable name — Ref returns the ARN. Same
+      # reasoning as keys.yaml's DynamoDbKmsAccessPolicy.
+      Description: Deliver VPC flow logs to the flow-log group.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Scoped to this one log group. CreateLogGroup is NOT granted: the
+          # group is created above by CloudFormation, so the delivery role
+          # only needs to open streams and write to it.
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource: !Sub "${VpcFlowLogGroup.Arn}:*"
+
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref Vpc
+      # ALL, not just REJECT: the question is what traffic is still SUCCEEDING
+      # through NAT, and rejects would not show that.
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VpcFlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt VpcFlowLogRole.Arn
+      LogFormat: >-
+        ${version} ${vpc-id} ${subnet-id} ${interface-id} ${srcaddr} ${dstaddr}
+        ${pkt-srcaddr} ${pkt-dstaddr} ${srcport} ${dstport} ${protocol}
+        ${packets} ${bytes} ${start} ${end} ${action} ${log-status}
+        ${flow-direction} ${traffic-path}
+      MaxAggregationInterval: 60
+      Tags:
+        - { Key: Project, Value: community-portal }
+        - { Key: Stage, Value: !Ref Stage }
+
+  # PublicRouteTable, PublicRoute (0.0.0.0/0 -> Igw) and both public subnet
+  # associations were deleted 2026-08-30 along with the subnets they served, as
+  # were the private default routes and the MultiNat AZ-B route table.
+  #
+  # The private route table STAYS, and now carries NO default route. It is still
+  # required for two things: the S3 and DynamoDB gateway endpoints attach to it
+  # (CloudFormation manages the prefix-list routes), and both private subnets
+  # associate with it. Deleting it would take DynamoDB and S3 access down with it,
+  # which is the opposite of the intent.
+  #
+  # The ABSENCE of a 0.0.0.0/0 entry is what makes this VPC closed: a packet with
+  # no matching route is dropped, rather than handed to an internet path.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PrivateSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable }
+  # Both private subnets share the single route table now that MultiNat is gone.
+  PrivateSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable }
+
+  # Pre-Token-Generation trigger (US-1.12/BR-R2): injects the portal role (and
+  # group-scope claims) into every ID token Cognito issues, so API Gateway's
+  # Cognito authorizer forwards a real `role` claim to in-service authZ. Without
+  # this, JWTs never carry `role` and every request is treated as Member
+  # regardless of the user's actual role. Reads the Identity & Access table
+  # directly (read-only) — kept in Foundation (not the Identity & Access -app
+  # stack) because the User Pool itself lives here and CloudFormation cannot
+  # wire a cross-stack Lambda trigger without a circular dependency.
+  TokenClaimsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "community-portal-token-claims-${Stage}"
+      Runtime: python3.12
+      MemorySize: 256
+      Timeout: 5
+      Handler: token_claims_handler.handler
+      CodeUri: ../services/identity-access/src/
+      VpcConfig:
+        SubnetIds: !Split [",", !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]]
+        SecurityGroupIds: [ !Ref LambdaSecurityGroup ]
+      Environment:
+        Variables:
+          # Passed in, not constructed. Building this as !Sub "identity-access-..."
+          # is what pinned the table to an explicit name (W28).
+          TABLE_NAME: !Ref IdentityAccessTableName
+      Policies:
+        # DynamoDB CMK use. Now a parameter rather than a local !Ref, because the
+        # policy moved to the keys stack (see infra/keys.yaml).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - Statement:
+            - Sid: ReadIdentityTable
+              Effect: Allow
+              Action: [ dynamodb:GetItem, dynamodb:Query ]
+              # Built from the passed-in name so this stays scoped to exactly one
+              # table without needing to know that table's name at author time.
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IdentityAccessTableName}"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IdentityAccessTableName}/index/*"
+  TokenClaimsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TokenClaimsFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "community-portal-${Stage}"
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy: { MinimumLength: 8, RequireUppercase: true, RequireLowercase: true, RequireNumbers: true, RequireSymbols: true }
+      UserPoolAddOns: { AdvancedSecurityMode: "OFF" }
+      # Cognito-native self sign-up (SignUp API) is disabled (AppSec finding: open
+      # self-registration). Self-registration (US-1.30) is instead implemented in
+      # application code via AdminCreateUser, gated by the Settings allow-list
+      # (BR-P3) before Cognito is ever called — see identity-access AuthService.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      LambdaConfig:
+        PreTokenGeneration: !GetAtt TokenClaimsFunction.Arn
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "community-portal-spa-${Stage}"
+      # ALLOW_ADMIN_USER_PASSWORD_AUTH is required by identity-access's
+      # CognitoAuthProvider.initiate_auth (AdminInitiateAuth with
+      # ADMIN_USER_PASSWORD_AUTH) — the server-side login flow (US-1.2).
+      ExplicitAuthFlows: [ALLOW_ADMIN_USER_PASSWORD_AUTH, ALLOW_USER_SRP_AUTH, ALLOW_CUSTOM_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      GenerateSecret: false
+
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties: { Name: !Sub "community-portal-${Stage}" }
+
+  # Destination for S3 server access logs from FileShareBucket. ACLs stay
+  # disabled (BucketOwnerEnforced default); delivery permission is granted to
+  # the S3 logging service principal via AccessLogBucketPolicy — the modern
+  # replacement for the legacy LogDeliveryWrite ACL. Not exposed publicly; logs
+  # expire on a short cycle since they are operational telemetry.
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    # Retain, not Delete: CloudFormation can only delete an EMPTY bucket, and
+    # this one accumulates server access logs continuously, so `Delete` did not
+    # mean "clean up" — it meant the stack delete FAILS with DELETE_FAILED.
+    # There is no custom resource that empties buckets on teardown. Retain is
+    # simply honest about what happens, and it preserves the access-log audit
+    # trail past a stack teardown. Trade-off accepted: teardowns leave an
+    # orphaned bucket behind. It cannot block a redeploy (the name is
+    # CloudFormation-generated, so there is no collision) and the 90-day
+    # lifecycle rule survives on the orphan, so it self-empties.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 90
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+
+  # Grants the S3 server-access-logging service permission to write log objects
+  # into AccessLogBucket. Scoped to this account (aws:SourceAccount) so no
+  # other account's buckets can deliver logs here. FileShareBucket DependsOn
+  # this policy so the grant exists before its LoggingConfiguration is validated.
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal: { Service: logging.s3.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub "${AccessLogBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          # Reject any request that did not arrive over TLS. The condition only
+          # matches plaintext HTTP, so it is unreachable for every legitimate
+          # caller (SDK/boto3 and presigned URLs are HTTPS), which is why the
+          # action is s3:* rather than a subset — narrowing it would leave
+          # ListBucket/DeleteObject/GetBucketPolicy reachable in the clear.
+          # BOTH ARNs are required: the bare bucket ARN covers bucket-level
+          # actions, the /* ARN covers object-level ones. Listing only /* is the
+          # common mistake that passes a scanner while leaving a gap.
+          - Sid: DenyNonTlsRequests
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt AccessLogBucket.Arn
+              - !Sub "${AccessLogBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # Pre-existing community S3 bucket for external file sharing (US-8.13, US-2.21).
+  # Private (no public access); write-only upload access is brokered exclusively
+  # via short-lived per-upload presigned PUT URLs minted by the Settings service;
+  # owner/download access via short-lived presigned GET URLs. Never a bucket
+  # policy granting broad access.
+  FileShareBucket:
+    Type: AWS::S3::Bucket
+    # Retain, not Delete: this holds member-uploaded files (file-share slots,
+    # certification evidence, Events materials and external uploads) with no
+    # backup anywhere, so a stack teardown must not be able to destroy them.
+    # `Delete` was also inert in practice — CloudFormation only deletes EMPTY
+    # buckets and this one is essentially never empty, so the teardown would have
+    # failed rather than cleaned up. That is now categorically true rather than
+    # merely likely: the lifecycle expiry rules were removed (see RETENTION
+    # below), so nothing empties this bucket on its own at any point, ever.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Ensure the log-delivery grant is in place before S3 validates this
+    # bucket's LoggingConfiguration against the destination bucket.
+    DependsOn: AccessLogBucketPolicy
+    Properties:
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }]
+      # S3 server access logging — records every request against this bucket
+      # (presigned PUT/GET traffic for file-share and event uploads) to a
+      # dedicated log bucket. The !Ref creates an implicit dependency so
+      # AccessLogBucket (with its Log Delivery grant) exists first.
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: file-share-access-logs/
+      # CORS (added 2026-08-06, Unit 6 live finding): the SPA uploads
+      # certification evidence/badge images from the BROWSER via presigned
+      # POST, and Events materials via presigned PUT. Without CORS the browser
+      # blocks the cross-origin call before it reaches S3 — invisible to every
+      # curl-based test (curl does not enforce CORS), which is exactly how it
+      # shipped unnoticed: Settings' file-share uploads are curl-only by user
+      # decision, and the EICAR verification used curl too. AllowedOrigin is
+      # '*' because the CloudFront domain is created AFTER Foundation (ApiEdge
+      # stack) — restricting it here would be a circular dependency; security
+      # is unaffected since authorization is the short-lived presigned
+      # URL/policy itself, not the Origin header (which any non-browser client
+      # can forge anyway).
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: ['*']
+            AllowedMethods: [POST, PUT]
+            AllowedHeaders: ['*']
+            MaxAge: 3600
+      # Object Created/Deleted are routed to EventBridge (default bus) so the
+      # Settings service can maintain stored file-share upload state instead of
+      # calling ListObjectsV2 on every page load (perf rework 2026-08-04).
+      # Deliberately EventBridge and not a direct LambdaConfiguration: that would
+      # require this bucket to name a function defined in a stack that already
+      # consumes this stack's outputs, closing a circular dependency. An
+      # EventBridge notification names no consumer, so Foundation stays standalone.
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      # Object versioning (Checkov CKV_AWS_21). ENABLED HERE AND NOWHERE ELSE in
+      # the solution, deliberately — the other four flagged buckets decline it,
+      # each for a documented reason. This bucket is the one that earns it: it
+      # holds member-uploaded files (file-share slots, certification evidence,
+      # Events materials, external uploads) with NO BACKUP ANYWHERE, and uploads
+      # arrive by presigned PUT which will happily overwrite an existing key.
+      # Versioning is the only thing standing between a repeated key and
+      # unrecoverable data loss.
+      #
+      # THE PART THAT IS EASY TO GET WRONG. Enabling versioning silently changes
+      # what a lifecycle Expiration rule MEANS. On a versioned bucket an
+      # Expiration action no longer deletes: it writes a delete marker and the
+      # object survives as a noncurrent version FOREVER unless
+      # NoncurrentVersionExpiration is also set. This bucket previously carried
+      # two Expiration rules, so ticking the versioning box on its own would have
+      # converted both retention limits into indefinite retention. Those rules
+      # have since been removed outright for unrelated and more serious reasons
+      # (see the RETENTION note below), but the trap is recorded because it is the
+      # reason NoncurrentVersionExpiration is mandatory here rather than optional.
+      #
+      # IT ALSO CHANGED A SECURITY CONTROL, which is the real reason this took
+      # care. This bucket carries a GuardDuty malware-protection plan, and
+      # Certifications quarantines an infected upload by DELETING it ("never
+      # serve an infected byte"). Under versioning that keyed delete only hides
+      # the object: the infected bytes remain as a noncurrent version, readable
+      # by any holder of s3:GetObjectVersion — which MalwareProtectionRole below
+      # has. So the quarantine path was changed in the same commit to purge every
+      # version by id (services/certifications/src/providers.py purge_object),
+      # and the certifications role gained s3:DeleteObjectVersion +
+      # s3:ListBucketVersions. Versioning without that change would have been a
+      # net security REGRESSION on the one bucket that takes untrusted uploads.
+      VersioningConfiguration:
+        Status: Enabled
+      # RETENTION: THE OBJECTS THEMSELVES NO LONGER EXPIRE ON A TIMER.
+      #
+      # Two rules were REMOVED here (ExpireOldUploads, 120 days bucket-wide, and
+      # ExpireEventExternalUploads, 180 days on events/). They were deleting
+      # member-uploaded content automatically, and nothing in this solution was
+      # built to survive that. Four findings, each independently sufficient:
+      #
+      #   1. THE METADATA NEVER EXPIRED, SO EVERY DELETION ORPHANED A ROW. TTL is
+      #      enabled on ten tables but `ttl` is only ever WRITTEN by
+      #      _conventions/idempotency.py, on idempotency records. No claim, event
+      #      material, library resource or file-share slot has ever carried one.
+      #      DynamoDB kept the row forever; S3 deleted the file at day 120.
+      #   2. AND THE FAILURE WAS NOT GRACEFUL. presign_get/generate_presigned_url
+      #      do not check existence — they sign a URL regardless. So the portal
+      #      went on rendering a working download button, minting a valid
+      #      signature, and handing the member a NoSuchKey. There is no "expired"
+      #      state anywhere in the code, because nothing was written expecting
+      #      files to disappear.
+      #   3. THE CONTENT IS IRREPLACEABLE — see the DeletionPolicy note above:
+      #      "no backup anywhere". Certification evidence is the sharpest case:
+      #      it is the proof underpinning an APPROVED credential, so deleting it
+      #      destroys the audit basis for a granted certification. The Content
+      #      Library contradicts expiry outright — its own module docstring
+      #      describes curated, community-wide, searchable content.
+      #   4. THE MODEL WAS NEVER VALIDATED END TO END. The 180-day rule never
+      #      worked: it overlapped the unprefixed 120-day rule, and where
+      #      overlapping rules give conflicting expirations S3 applies the
+      #      EARLIER one, so events/ objects died at day 120 and the 180-day rule
+      #      could never fire. It had been dead since it was written.
+      #
+      # DELETION IS AN ACTION, NOT A TIMER. The code already supports it: there
+      # are explicit delete paths in Certifications, Events and Settings, so
+      # members, CLs and admins remove content deliberately. That is the right
+      # mechanism; a clock that silently destroys unbacked uploads is not.
+      #
+      # COST IS ACCEPTED, DELIBERATELY AND WITH THE NUMBER KNOWN. Current versions
+      # now grow without bound, and MAX_MATERIAL_BYTES is 500 MB, so events/ and
+      # library/ are the drivers. Accepted on review. If it ever needs bounding,
+      # the answer is a Transition to Intelligent-Tiering or Glacier IR — NOT
+      # reinstating deletion, which is what caused all of the above.
+      LifecycleConfiguration:
+        Rules:
+          # Bounds VERSION HISTORY only — current objects are untouched and
+          # permanent. This is the counterweight to enabling versioning: without
+          # it, every overwrite and every user-initiated delete would accumulate
+          # a noncurrent version forever.
+          #
+          # It also gives the user-initiated deletes in Events and Settings their
+          # own sensible semantics, which is why those were deliberately left as
+          # soft (keyed) deletes: content a member removes is recoverable for 30
+          # days and then genuinely gone. Better than vanishing instantly, and
+          # better than being retained indefinitely.
+          #
+          # NOT a substitute for the removed rules: this expires SUPERSEDED and
+          # DELETED versions, never a live object.
+          - Id: ExpireNoncurrentVersionsOnly
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          # KEPT, and not to be confused with the removed expiry rules. This
+          # reaps abandoned multipart uploads — fragments that are billable and
+          # can never be read by anyone. It deletes no content.
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+          # Sweeps delete markers with no versions left underneath them. A keyed
+          # delete leaves a marker behind, and once the rule above removes the
+          # last noncurrent version the marker alone would keep the key listable
+          # forever.
+          #
+          # SEPARATE RULE by necessity: S3 rejects a single rule carrying both
+          # ExpiredObjectDeleteMarker and an Expiration/ExpirationInDays.
+          - Id: RemoveExpiredDeleteMarkers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+
+  # Generated CSV exports (Admin > Users > Export CSV — async export job).
+  #
+  # DELIBERATELY a separate bucket rather than an `exports/` prefix inside
+  # FileShareBucket. Four reasons, each of which would otherwise be a trap:
+  #   * LIFETIME — these objects are ephemeral (expire in 1 day), and that expiry
+  #     IS the privacy control for member PII. FileShareBucket now expires nothing
+  #     at all (its content is permanent until deleted deliberately), so the two
+  #     retention models are opposites and a bucket-wide rule here states the
+  #     intent plainly instead of layering a prefix-scoped exception onto a
+  #     bucket whose default is "keep forever".
+  #   * EVENT FAN-OUT — FileShareBucket publishes Object Created/Deleted to
+  #     EventBridge, and every consumer there must be listed in an `anything-but`
+  #     prefix filter (see service-settings-app.yaml FileShareObjectRule). A new
+  #     prefix would silently feed export objects to Settings' file-share
+  #     consumer, which would find no pointer record and burn an idempotency
+  #     write per export. This bucket publishes nothing, so that cannot happen.
+  #   * MALWARE SCANNING — FileShareBucket carries a GuardDuty malware-protection
+  #     plan because it accepts UNTRUSTED user uploads. These CSVs are generated
+  #     server-side from our own data, so scanning them would add cost and
+  #     latency protecting against nothing.
+  #   * CORS — FileShareBucket allows cross-origin POST/PUT for browser uploads.
+  #     Downloads here are presigned GETs followed by a link, which need no CORS,
+  #     so this bucket grants none.
+  #
+  # TLS-only enforcement for FileShareBucket. This bucket takes presigned
+  # browser PUT/POST uploads and serves presigned GETs, so an unencrypted
+  # request would expose both the object bytes and the signed URL itself.
+  # See DenyNonTlsRequests on AccessLogBucketPolicy for why s3:* and both ARNs.
+  FileShareBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FileShareBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonTlsRequests
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt FileShareBucket.Arn
+              - !Sub "${FileShareBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # Private, like every other bucket here: no public access, no bucket policy
+  # granting broad reads. Access is exclusively via a short-lived presigned GET
+  # minted per request and never stored. Server access logging is ON because an
+  # export contains the full member roster (names + email addresses) — knowing
+  # who downloaded one is worth retaining.
+  UserExportBucket:
+    Type: AWS::S3::Bucket
+    # Retain, not Delete: same reasoning as the other two (CloudFormation only
+    # deletes EMPTY buckets, so `Delete` risked DELETE_FAILED rather than a
+    # clean teardown).
+    # PRIVACY NOTE: exports are full member rosters (names + emails). Retaining
+    # the bucket past a teardown does leave PII in an orphan — that is
+    # tolerable ONLY because the ExpireUserExports lifecycle rule (1 day)
+    # survives on the orphaned bucket and empties it. If that rule is ever
+    # removed or lengthened, revisit this policy at the same time.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Same ordering requirement as FileShareBucket: the log-delivery grant must
+    # exist before S3 validates this bucket's LoggingConfiguration.
+    DependsOn: AccessLogBucketPolicy
+    Properties:
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }]
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: user-export-access-logs/
+      LifecycleConfiguration:
+        Rules:
+          # The ONLY cleanup mechanism for exports (product decision: no
+          # delete-on-download, because a presigned GET is a direct
+          # browser-to-S3 transfer the backend never observes completing).
+          # 1 day is S3 lifecycle's minimum granularity; the 5-minute presigned
+          # URL TTL is what actually bounds reachability in the meantime.
+          - Id: ExpireUserExports
+            Status: Enabled
+            ExpirationInDays: 1
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+
+  # TLS-only enforcement for UserExportBucket. Highest-value of the three: the
+  # objects are full member rosters (names + email addresses) fetched by
+  # presigned GET, so plaintext transport would leak PII and the signed URL.
+  # See DenyNonTlsRequests on AccessLogBucketPolicy for why s3:* and both ARNs.
+  UserExportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UserExportBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonTlsRequests
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt UserExportBucket.Arn
+              - !Sub "${UserExportBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # Malware scanning for the shared community bucket (Unit 4 decision N1).
+  # Placed on the BUCKET OWNER rather than in a consumer stack, so coverage
+  # cannot depend on which consumer happened to deploy last — and so Settings'
+  # file-share uploads are protected as well as Events' materials and external
+  # uploads. Scan results are published to EventBridge; each consumer subscribes
+  # for its own key prefix and gates content visibility on a clean result.
+  #
+  # This closes the one candidate blocking security finding for Unit 4:
+  # externally-supplied files (US-2.21 accepts uploads from parties with no
+  # portal account) being served to members unscanned.
+  MalwareProtectionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: malware-protection-plan.guardduty.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - !Ref MalwareProtectionPolicy
+
+  # Customer-managed rather than inline for the reason given on
+  # VpcFlowLogDeliveryPolicy above (IAM_NO_INLINE_POLICY_CHECK). Permissions are
+  # unchanged from the inline version.
+  #
+  # The ManagedPolicyArns direction is load-bearing HERE IN PARTICULAR:
+  # GuardDuty validates this role's S3 and notification permissions when the
+  # MalwareProtectionPlan below is created (see the 2026-08-05 note in the
+  # statement comments). If the policy were attached via a `Roles` list, the role
+  # could reach CREATE_COMPLETE unpermissioned and the plan create could run
+  # against it and fail exactly the way it did on the first real deploy.
+  MalwareProtectionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      # ManagedPolicyName deliberately NOT set — see cfn_nag W28 note above.
+      Description: Scan and tag objects in the community file-share bucket.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ListBucketForScanning
+            Effect: Allow
+            Action: [ s3:ListBucket, s3:GetBucketLocation ]
+            Resource: !GetAtt FileShareBucket.Arn
+          # GuardDuty verifies (and will enable if absent) EventBridge event
+          # delivery on the protected bucket at plan-creation time, so the
+          # role needs the notification-config permissions. Without these the
+          # create fails with "the provided IAM role does not have the
+          # required S3 bucket notification permissions to verify and enable
+          # S3 EventBridge event delivery" — found on the first real deploy,
+          # 2026-08-05. The bucket already has EventBridgeEnabled: true, so
+          # in practice GuardDuty only reads it.
+          - Sid: VerifyBucketEventBridgeDelivery
+            Effect: Allow
+            Action: [ s3:GetBucketNotification, s3:PutBucketNotification ]
+            Resource: !GetAtt FileShareBucket.Arn
+          - Sid: ReadAndTagObjects
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:GetObjectTagging
+              - s3:PutObjectTagging
+              - s3:GetObjectVersionTagging
+              - s3:PutObjectVersionTagging
+            Resource: !Sub "${FileShareBucket.Arn}/*"
+          - Sid: EventBridgeManagedRule
+            Effect: Allow
+            Action: [ events:PutRule, events:DeleteRule, events:PutTargets,
+                      events:RemoveTargets, events:DescribeRule, events:ListTargetsByRule ]
+            Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/DO-NOT-DELETE-AmazonGuardDutyMalwareProtection*"
+
+  FileShareMalwareProtection:
+    Type: AWS::GuardDuty::MalwareProtectionPlan
+    Properties:
+      Role: !GetAtt MalwareProtectionRole.Arn
+      ProtectedResource:
+        S3Bucket:
+          BucketName: !Ref FileShareBucket
+      # Tag infected objects so a quarantined file is identifiable in the bucket
+      # itself, not only in the owning service's table.
+      Actions:
+        Tagging: { Status: ENABLED }
+
+  # ── Token-claims fallback signal ──────────────────────────────────────────
+  # The single most consequential silent degradation in the system, and it had no
+  # alarm at all.
+  #
+  # token_claims_handler enriches every ID token with the caller's portal role.
+  # Its DynamoDB lookup is wrapped in `except Exception` with the comment "never
+  # fail sign-in on a claims-lookup error", and on failure it substitutes
+  # role=Member, led_group_id="" and no group ids (token_claims_handler.py:52).
+  #
+  # Failing open on availability is the right call — nobody should be locked out
+  # because a read blipped — but the consequence is that a CommunityLeader or
+  # UserGroupLeader receives a Member token and silently loses their leader
+  # surfaces for that whole session. Every downstream service then authorises
+  # correctly against a wrong role, so nothing anywhere reports an error. The
+  # user just sees a portal missing half its features.
+  #
+  # Its log group was auto-created by Lambda with NO retention policy, so it is
+  # brought under the stack here as well.
+  TokenClaimsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/community-portal-token-claims-${Stage}"
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
+  TokenClaimsFallbackMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TokenClaimsLogGroup
+      # Plain-text substring, not { $.message = ... }: it matches whether the
+      # line is structured JSON or Lambda's default text format. See the
+      # per-service degradation filters for why that distinction bites.
+      FilterPattern: '"token claims lookup failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/IdentityAccess
+          MetricName: TokenClaimsFallbacks
+          MetricValue: '1'
+  TokenClaimsFallbackAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "A sign-in received role=Member because the claims lookup failed; leaders silently lose their role for that session"
+      Namespace: Portal/IdentityAccess
+      MetricName: TokenClaimsFallbacks
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      # Threshold 1: a single occurrence means at least one person signed in with
+      # the wrong role. There is no acceptable steady-state rate for this.
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopic ]
+
+  OpsAlarmTopic:
+    Type: AWS::SNS::Topic
+    # SSE with the AWS-managed key for SNS (alias/aws/sns) encrypts alarm
+    # metadata at rest. No key-management overhead; no CMK needed for this
+    # ops-only topic.
+    Properties:
+      # No explicit TopicName (cfn_nag W28). Consumers take OpsAlarmTopicArn as a
+      # parameter, so nothing needs a predictable name.
+      #
+      # REMOVING THE NAME REPLACED THIS TOPIC, which recreated OpsAlarmSubscription
+      # below. An email subscription starts in PendingConfirmation, so ALARM EMAILS
+      # DO NOT DELIVER until the recipient clicks the new confirmation link. That is
+      # a monitoring gap, not a deploy failure — the stack reports success either
+      # way. Check with:
+      #   aws sns list-subscriptions-by-topic --topic-arn <arn>
+      # and look for SubscriptionArn == "PendingConfirmation".
+      KmsMasterKeyId: alias/aws/sns
+  OpsAlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Properties: { TopicArn: !Ref OpsAlarmTopic, Protocol: email, Endpoint: !Ref OpsEmail }
+
+  # Security group for all Lambda functions. Lambdas are egress-only (API
+  # Gateway invokes them via the AWS service plane, not through a VPC path).
+  # Allows all outbound so Lambdas can reach NAT → Internet for services that
+  # have no VPC Gateway endpoint (EventBridge, Cognito, API GW, etc.).
+  # DynamoDB and S3 are served by Gateway VPC endpoints — no NAT needed.
+  # Self-referencing inbound on 443: required for OpenSearch Serverless VPC
+  # endpoint — the endpoint and Lambdas share this SG, so the endpoint must
+  # accept HTTPS from members of the same group.
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W5
+            reason: "All-egress required for Lambda VPC access to AWS service endpoints (EventBridge, Cognito, API GW) that have no Gateway VPC endpoint"
+          - id: W40
+            reason: "All-protocol egress required for Lambda-to-AWS-service communication in VPC; restricting would need a paid Interface Endpoint per service"
+    Properties:
+      GroupDescription: Lambda functions - egress only, HTTPS inbound for AOSS VPC endpoint
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic for Lambda VPC access to AWS service endpoints
+      Tags:
+        - { Key: Project, Value: community-portal }
+        - { Key: Stage, Value: !Ref Stage }
+
+  # Allow HTTPS inbound within the SG so the OpenSearch Serverless VPC endpoint
+  # (which shares LambdaSecurityGroup) accepts connections from Lambda functions.
+  LambdaSecurityGroupAossIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: AOSS VPC endpoint - HTTPS from Lambda SG (self-reference)
+
+  # ---------------------------------------------------------------------------
+  # OpenSearch Serverless — admin user + member directory search.
+  # Traffic reaches it exclusively through the VPC endpoint below (no public
+  # access).
+  #
+  # COST MODEL — read this before changing anything here.
+  #
+  # AOSS bills per OCU-HOUR (~$0.24), continuously, not per query. Until
+  # 2026-08-31 this block carried the comment "NextGen architecture
+  # (scale-to-zero, min OCU = 0)" while setting NO capacity configuration at
+  # all. That comment was wrong in every particular: the collection was a
+  # CLASSIC collection, in no collection group, and therefore ran at the default
+  # floor of 2 OCUs (1 indexing + 1 search, redundant replicas enabled) — about
+  # $350/month, 24/7, for a corpus of ~25k documents that is only queried a few
+  # hours a day. The comment is why that went unnoticed.
+  #
+  # Scale-to-zero is ONLY available to NextGen collections that belong to a
+  # collection group, so the group below is not optional decoration — it is the
+  # thing that makes min OCU 0 legal. Classic groups cannot go below 1.
+  # ---------------------------------------------------------------------------
+
+  # Collection group — the unit that owns capacity limits and therefore the bill.
+  #
+  # MinIndexingCapacityInOcu/MinSearchCapacityInOcu of 0 is what enables
+  # scale-to-zero: after 10 minutes with no requests across every collection in
+  # the group, compute drops to 0 OCU and billing stops. That idle window is
+  # fixed by AWS and not configurable.
+  #
+  # The cost of that is LATENCY, and it is user-visible: the first request to
+  # each component after an idle period takes 10-30s while workers are
+  # re-provisioned. Search and indexing wake independently. The repository
+  # clients already allow for this (timeout=60, with a comment about 10-30s
+  # cold starts), so it degrades to a slow first page rather than an error — but
+  # on a portal used ~4 hours a day, somebody pays that cost every morning.
+  #
+  # Max of 2 OCU each: valid NextGen values are 0, 2, 4, 8, 16 and multiples of
+  # 16. Two is the smallest non-zero ceiling and is ample for ~25k documents;
+  # it also caps the downside if a runaway reindex tries to scale out.
+  OpenSearchCollectionGroup:
+    Type: AWS::OpenSearchServerless::CollectionGroup
+    Properties:
+      Name: !Sub "portal-search-grp-${Stage}"
+      Generation: NEXTGEN
+      # ENABLED is MANDATORY here, not a preference. DISABLED was tried first, to
+      # halve the active footprint to 1 OCU, and CreateCollectionGroup rejected it
+      # outright (2026-08-31, verified against the service, not inferred):
+      #
+      #   "StandbyReplicas cannot be set to DISABLED for NEXTGEN collection
+      #    groups. (Service: OpenSearchServerless, Status Code: 400)"
+      #
+      # cfn-lint and sam validate both accept DISABLED — the schema allows it and
+      # only the service enforces the rule — so this cannot be caught before
+      # deploy. Do not "optimise" it back to DISABLED; it fails the stack update
+      # and rolls back every other change in the same changeset with it.
+      #
+      # Cost consequence: the ACTIVE footprint stays at 2 OCU (1 indexing +
+      # 1 search) rather than 1. That is a smaller loss than it sounds, because
+      # the saving here comes almost entirely from the min-0 floor below, not from
+      # the active tier: idle hours cost nothing either way.
+      StandbyReplicas: ENABLED
+      CapacityLimits:
+        MinIndexingCapacityInOcu: 0
+        MinSearchCapacityInOcu: 0
+        MaxIndexingCapacityInOcu: 2
+        MaxSearchCapacityInOcu: 2
+
+  # VPC endpoint: Lambda (private subnets) → OpenSearch Serverless data plane.
+  #
+  # This is a STANDARD AWS::EC2::VPCEndpoint, not AWS::OpenSearchServerless::
+  # VpcEndpoint, and the distinction is the whole reason the first NextGen deploy
+  # broke. AOSS has two mutually exclusive endpoint mechanisms:
+  #
+  #   Classic  -> AWS::OpenSearchServerless::VpcEndpoint. The service creates a
+  #               Route 53 private hosted zone resolving *.us-east-1.aoss.amazonaws.com.
+  #   NextGen  -> a plain interface endpoint on com.amazonaws.<region>.aoss-data,
+  #               whose PrivateLink-managed DNS resolves *.aoss.<region>.on.aws.
+  #
+  # Moving the collection into a NextGen collection group changed its endpoint
+  # from the aoss.amazonaws.com domain to rt08...aoss.us-east-1.on.aws. The old
+  # managed endpoint's hosted zone does not cover that domain, so DNS fell through
+  # to the PUBLIC address — and because this VPC has no NAT and no IGW, every
+  # request hung until the 60s client timeout instead of failing fast:
+  #
+  #   ConnectTimeout: rt08d9i7yunpcxbiqbp8.aoss.us-east-1.on.aws:443
+  #
+  # A timeout rather than a 403 is the tell that this is DNS/routing, not authz.
+  #
+  # The managed (Classic) endpoint that used to be here was DELETED rather than
+  # left alongside: it can only serve Classic collections, there are none left in
+  # this stack, and an idle interface endpoint still bills ~$15/month per AZ pair.
+  #
+  # PrivateDnsEnabled is mandatory — it is what attaches the resolution for
+  # *.aoss.us-east-1.on.aws. Verified against describe-vpc-endpoint-services:
+  # that name is present in PrivateDnsNames with VerificationState=verified,
+  # alongside the *.aoss-fips.* variant.
+  OpenSearchDataVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.aoss-data"
+      VpcEndpointType: Interface
+      VpcId: !Ref Vpc
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      # Shares LambdaSecurityGroup, so reaching it needs the self-referencing
+      # 443 ingress rule (LambdaSecurityGroupAossIngress above) — same
+      # arrangement the managed endpoint used.
+      SecurityGroupIds:
+        - !Ref LambdaSecurityGroup
+
+  # Encryption policy — server-side encryption with AWS-owned key (simplest,
+  # no KMS cost; upgrade to customer-managed key if compliance requires it).
+  OpenSearchEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "portal-users-enc-${Stage}"
+      Type: encryption
+      Policy: !Sub |
+        {
+          "Rules": [{ "Resource": ["collection/portal-search-${Stage}"], "ResourceType": "collection" }],
+          "AWSOwnedKey": true
+        }
+
+  # Network policy — VPC-only access; public access disabled entirely.
+  # No explicit DependsOn: the !Ref to OpenSearchDataVpcEndpoint in the policy
+  # body below already orders this after the endpoint, and adding both trips
+  # cfn-lint W3005.
+  OpenSearchNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "portal-users-net-${Stage}"
+      Type: network
+      Policy: !Sub
+        - |
+          [
+            {
+              "Rules": [
+                { "Resource": ["collection/portal-search-${Stage}"], "ResourceType": "collection" },
+                { "Resource": ["collection/portal-search-${Stage}"], "ResourceType": "dashboard" }
+              ],
+              "AllowFromPublic": false,
+              "SourceVPCEs": ["${VpceId}"]
+            }
+          ]
+        # !Ref on an AWS::EC2::VPCEndpoint returns the vpce- id, which is what
+        # SourceVPCEs expects. The docs confirm a standard PrivateLink endpoint id
+        # is used in network policies exactly like a managed one.
+        - VpceId: !Ref OpenSearchDataVpcEndpoint
+
+  # Collection — SEARCH type: all data on hot storage (no warm tier). Hosts the
+  # single 'members' index, owned by member-profiles and partially updated by
+  # identity-access.
+  #
+  # RENAMED from portal-users-${Stage} to portal-search-${Stage} on 2026-08-31,
+  # and the rename is LOAD-BEARING, not cosmetic.
+  #
+  # Both StandbyReplicas and CollectionGroupName are create-only — CloudFormation
+  # can only apply them by REPLACING the collection. A replacement keeps the old
+  # resource alive until the new one exists, so a fixed unique name would collide
+  # with itself and fail the stack update. Changing the name is what lets the
+  # replacement land. The three security/access policies below were updated to
+  # match; they embed the collection name as a literal string, so leaving any of
+  # them on the old name would create a collection with no encryption policy
+  # (creation fails) or no data-access policy (every query 403s).
+  #
+  # DEPLOY CONSEQUENCE: the 'members' index does NOT survive this. The new
+  # collection starts empty and the endpoint URL changes, which rolls both app
+  # stacks. Reindex afterwards, member-profiles FIRST then identity-access —
+  # member-profiles writes whole documents (index) while identity-access merges
+  # identity fields (update/doc_as_upsert), so the reverse order loses bio,
+  # skills and groupIds. That is the order nightly_jobs_service.py already uses.
+  #
+  # Until the reindex completes: the admin user list degrades to its DynamoDB
+  # GSI2 fallback, but the member directory returns an EMPTY list with HTTP 200
+  # (member-profiles has no fallback — repository.py:206-208). Plan the window.
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn:
+      - OpenSearchCollectionGroup
+      - OpenSearchEncryptionPolicy
+      - OpenSearchNetworkPolicy
+    Properties:
+      Name: !Sub "portal-search-${Stage}"
+      Type: SEARCH
+      # Inherits capacity (and therefore scale-to-zero) from the group.
+      #
+      # Spelled as a literal !Sub rather than !Ref OpenSearchCollectionGroup on
+      # purpose: this property takes the group's NAME, and Ref's return value for
+      # AWS::OpenSearchServerless::CollectionGroup is not documented as being the
+      # name — if it returns an id instead, the Ref version would validate fine
+      # and then fail at deploy. The literal keeps the ordering dependency
+      # explicit in DependsOn above, where it is visible.
+      CollectionGroupName: !Sub "portal-search-grp-${Stage}"
+      # ENABLED to match the group, which NEXTGEN forces. See the note there.
+      StandbyReplicas: ENABLED
+      Description: !Sub "Shared search index for Admin Users and Member Directory (${Stage})"
+      Tags:
+        - { Key: Project, Value: community-portal }
+        - { Key: Stage, Value: !Ref Stage }
+
+  # Data access policy — grants all Lambda execution roles in this account
+  # full CRUD on the collection and all indexes within it (including 'members').
+  # The index resource pattern is a wildcard covering any index name.
+  OpenSearchDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub "portal-users-data-${Stage}"
+      Type: data
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "Resource": ["collection/portal-search-${Stage}"],
+                "Permission": ["aoss:CreateCollectionItems","aoss:DeleteCollectionItems","aoss:UpdateCollectionItems","aoss:DescribeCollectionItems"],
+                "ResourceType": "collection"
+              },
+              {
+                "Resource": ["index/portal-search-${Stage}/*"],
+                "Permission": ["aoss:CreateIndex","aoss:DeleteIndex","aoss:UpdateIndex","aoss:DescribeIndex","aoss:ReadDocument","aoss:WriteDocument"],
+                "ResourceType": "index"
+              }
+            ],
+            "Principal": ["arn:aws:iam::${AWS::AccountId}:root"],
+            "Description": "Lambda roles - shared members search index"
+          }
+        ]
+
+Outputs:
+  VpcId: { Value: !Ref Vpc }
+  # Only the two routable private subnets are exported — these are where Lambdas
+  # run. Both are placed by AzSelector in AZs that support every interface
+  # endpoint, so consumers get multi-AZ placement with no AZ assumptions of their
+  # own.
+  PrivateSubnetIds: { Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]] }
+  LambdaSecurityGroupId: { Value: !Ref LambdaSecurityGroup }
+  # Consumed by the API Edge stack in the next phase: a PRIVATE REST API must
+  # name the execute-api endpoint it is reachable through.
+  ExecuteApiVpcEndpointId: { Value: !Ref ExecuteApiEndpoint }
+  VpcEndpointSecurityGroupId: { Value: !Ref VpcEndpointSecurityGroup }
+  VpcFlowLogGroupName: { Value: !Ref VpcFlowLogGroup }
+  # Passed as a Parameter to api-edge and every -app stack so their log groups can
+  # set KmsKeyId. Must be the ARN: the KmsKeyId property pattern accepts only
+  # arn:...:(key|alias)/..., never a bare key id or alias name.
+  LogsKmsKeyArn: { Value: !GetAtt LogsKmsKey.Arn }
+  # Passed as a Parameter to api-edge so SpaBucket and CloudFrontLogBucket can set
+  # LoggingConfiguration against the same destination FileShareBucket and
+  # UserExportBucket already use (CKV_AWS_18). The bucket NAME, not the ARN:
+  # DestinationBucketName takes a bare bucket name.
+  #
+  # AccessLogBucketPolicy (the logging.s3.amazonaws.com PutObject grant) lives in
+  # this stack, and this stack completes before api-edge starts, so the grant is
+  # in place before S3 validates any consumer's LoggingConfiguration — which is
+  # what the DependsOn: AccessLogBucketPolicy on the two buckets above achieves
+  # within this stack.
+  AccessLogBucketName: { Value: !Ref AccessLogBucket }
+  # The DynamoDB CMK and its access policy are NOT output here any more — they moved
+  # to infra/keys.yaml to break a dependency cycle. Consumers take them from Keys.
+  UserPoolId: { Value: !Ref UserPool }
+  UserPoolArn: { Value: !GetAtt UserPool.Arn }
+  UserPoolClientId: { Value: !Ref UserPoolClient }
+  EventBusName: { Value: !Ref EventBus }
+  OpsAlarmTopicArn: { Value: !Ref OpsAlarmTopic }
+  LogRetentionDays: { Value: !Ref LogRetentionDays }
+  FileShareBucketName: { Value: !Ref FileShareBucket }
+  FileShareBucketArn: { Value: !GetAtt FileShareBucket.Arn }
+  UserExportBucketName: { Value: !Ref UserExportBucket }
+  UserExportBucketArn: { Value: !GetAtt UserExportBucket.Arn }
+  OpenSearchEndpoint: { Value: !GetAtt OpenSearchCollection.CollectionEndpoint }
+  OpenSearchCollectionArn: { Value: !GetAtt OpenSearchCollection.Arn }

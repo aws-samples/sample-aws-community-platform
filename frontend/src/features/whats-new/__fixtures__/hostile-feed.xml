@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ADVERSARIAL FIXTURE — sanitizer tests only.
+
+  Deliberately kept in the frontend test tree and NOT in infra/whats-new-feed/,
+  because everything in that folder is publishable mirror content and this file
+  must never be servable.
+
+  Each item carries an injection attempt that a feed we do not control could
+  plausibly deliver. The sanitizer (sanitize.ts) must neutralize all of them
+  while preserving the benign formatting in the last item.
+-->
+<rss version="2.0">
+  <channel>
+    <title>Hostile feed fixture</title>
+    <link>https://example.invalid/feed</link>
+    <description>Injection attempts for sanitizer tests.</description>
+
+    <item>
+      <guid isPermaLink="false">hostile-script</guid>
+      <title>Script tag in description</title>
+      <link>https://example.invalid/1</link>
+      <pubDate>Mon, 10 Aug 2026 10:00:00 GMT</pubDate>
+      <category>Security</category>
+      <description><![CDATA[<p>Benign opening paragraph.</p><script>window.__pwned = true;</script><p>Benign closing paragraph.</p>]]></description>
+    </item>
+
+    <item>
+      <guid isPermaLink="false">hostile-onerror</guid>
+      <title>Inline event handler</title>
+      <link>https://example.invalid/2</link>
+      <pubDate>Mon, 10 Aug 2026 09:00:00 GMT</pubDate>
+      <category>Security</category>
+      <description><![CDATA[<p onmouseover="window.__pwned = true">Hover me</p><img src="x" onerror="window.__pwned = true" />]]></description>
+    </item>
+
+    <item>
+      <guid isPermaLink="false">hostile-js-href</guid>
+      <title>javascript: URL in a link</title>
+      <link>https://example.invalid/3</link>
+      <pubDate>Mon, 10 Aug 2026 08:00:00 GMT</pubDate>
+      <category>Security</category>
+      <description><![CDATA[<p><a href="javascript:window.__pwned=true">Click me</a></p>]]></description>
+    </item>
+
+    <item>
+      <guid isPermaLink="false">hostile-iframe</guid>
+      <title>Embedded iframe and object</title>
+      <link>https://example.invalid/4</link>
+      <pubDate>Mon, 10 Aug 2026 07:00:00 GMT</pubDate>
+      <category>Security</category>
+      <description><![CDATA[<iframe src="https://evil.invalid/"></iframe><object data="https://evil.invalid/"></object><embed src="https://evil.invalid/" />]]></description>
+    </item>
+
+    <item>
+      <guid isPermaLink="false">hostile-style</guid>
+      <title>Inline style and style block</title>
+      <link>https://example.invalid/5</link>
+      <pubDate>Mon, 10 Aug 2026 06:00:00 GMT</pubDate>
+      <category>Security</category>
+      <description><![CDATA[<style>body { display: none }</style><p style="position:fixed;inset:0;background:red">Covering overlay</p>]]></description>
+    </item>
+
+    <item>
+      <guid isPermaLink="false">hostile-svg</guid>
+      <title>SVG script vector</title>
+      <link>https://example.invalid/6</link>
+      <pubDate>Mon, 10 Aug 2026 05:00:00 GMT</pubDate>
+      <category>Security</category>
+      <description><![CDATA[<svg><script>window.__pwned = true;</script></svg>]]></description>
+    </item>
+
+    <item>
+      <guid isPermaLink="false">benign-formatting</guid>
+      <title>Benign formatting that must survive</title>
+      <link>https://example.invalid/7</link>
+      <pubDate>Mon, 10 Aug 2026 04:00:00 GMT</pubDate>
+      <category>Compute</category>
+      <description><![CDATA[<p>A paragraph with <strong>bold</strong>, <em>italic</em> and <code>inline code</code>.</p><ul><li>First</li><li>Second</li></ul><p>A <a href="https://aws.amazon.com/ec2/" title="EC2">real link</a>.</p>]]></description>
+    </item>
+  </channel>
+</rss>

@@ -1,0 +1,115 @@
+openapi: 3.0.3
+info: { title: Announcements API, version: 2.0.0 }
+# v2.0.0 (2026-08-07, Unit 9 Functional/Code Generation):
+#  - structured target {scope, groupIds} (replaces flat `audience` string on input;
+#    `audience`/`source` remain read-only computed labels on responses)
+#  - mandatory expiry (default 2d, max 90d — server defaults/clamps; optional in body)
+#  - rich-text `body`, `emailOptIn`; denormalized author/source on responses
+#  - listAnnouncements gains `view` (panel|mine) + `scope` (all, CL moderation)
+#  - dismissAnnouncement REMOVED — dismissal is client-side/localStorage (BR-11)
+paths:
+  /announcements:
+    get:
+      operationId: listAnnouncements
+      parameters:
+        - { name: view, in: query, required: false, schema: { type: string, enum: [panel, mine] } }
+        - { name: scope, in: query, required: false, schema: { type: string, enum: [all] } }
+      responses:
+        '200': { description: Announcements, content: { application/json: { schema: { $ref: '#/components/schemas/AnnList' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NI' }
+    post:
+      operationId: createAnnouncement
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string, maxLength: 200 }
+                body: { type: string, description: 'Markdown (stored inert; rendered + sanitized at the client with markdown-it html:false + DOMPurify)' }
+                target: { $ref: '#/components/schemas/Target' }
+                expiresAt: { type: string, format: date-time, nullable: true, description: 'Optional; server defaults to +2 days and clamps to +90 days max' }
+                emailOptIn: { type: boolean, default: false }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Announcement' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NI' }
+  /announcements/{id}:
+    put:
+      operationId: editAnnouncement
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string, maxLength: 200 }
+                body: { type: string }
+                target: { $ref: '#/components/schemas/Target' }
+                expiresAt: { type: string, format: date-time, nullable: true }
+                emailOptIn: { type: boolean }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Announcement' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501': { $ref: '#/components/responses/NI' }
+    delete:
+      operationId: deleteAnnouncement
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501': { $ref: '#/components/responses/NI' }
+components:
+  responses:
+    Forbidden: { description: Forbidden, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    BadRequest: { description: Bad request, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: Not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NI: { description: Not yet implemented, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  schemas:
+    Target:
+      type: object
+      required: [scope]
+      properties:
+        scope: { type: string, enum: [community, groups] }
+        groupIds: { type: array, items: { type: string }, description: 'Required non-empty when scope=groups; ignored for UGL (forced to their led group)' }
+    Announcement:
+      type: object
+      required: [id, title, target, active, status]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        body: { type: string, description: 'Markdown (client renders + sanitizes)' }
+        target: { $ref: '#/components/schemas/Target' }
+        audience: { type: string, description: 'Computed label — "Community-wide" or group name(s)' }
+        source: { type: string, description: 'Panel meta label (same as audience)' }
+        authorId: { type: string }
+        authorName: { type: string }
+        authorRoleLabel: { type: string, description: '"Community Leader" | "User Group Leader"' }
+        emailOptIn: { type: boolean }
+        emailSent: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        active: { type: boolean }
+        status: { type: string, enum: [Active, Expired] }
+    AnnList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Announcement' } }
+        count: { type: integer }
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        correlationId: { type: string }

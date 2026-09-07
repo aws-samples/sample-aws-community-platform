@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# SAM / build
+.aws-sam/
+dist/
+packaged.yaml
+samconfig.local.toml
+# `make build` stages each service's vendored dependencies into
+# services/<svc>/build/ before zipping. That is third-party code (~129 MB across
+# 12 services) and must never be committed — found during Build and Test
+# 2026-08-05, when these directories showed up as untracked and broke `ruff`.
+services/*/build/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/src/generated/
+
+# OS / editor
+.DS_Store
+*.log
+.idea/
+.vscode/
+
+# Playwright MCP test artifacts
+.playwright-mcp/
+
+# Kiro local settings (may contain secrets/tokens)
+.kiro/settings/
+
+# Built SPA bundle staged into the seed Lambda at deploy time
+platform/seed/spa/*
+!platform/seed/spa/.gitkeep
+infra/tools/.gsi-stage-cache-*.json
+.deploy-staging/
+*.tsbuildinfo
+load-testing/
+
+# System test cases — local development artifacts, not committed to the repo
+system-testcases/

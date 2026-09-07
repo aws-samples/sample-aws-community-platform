@@ -1,0 +1,68 @@
+{
+  "title": "EventLifecycleEvents",
+  "description": "Events service lifecycle domain events (v1), carried in the platform event envelope 'data' field. Published AFTER the primary write commits, so a publish failure never fails a committed write. Consumers must be idempotent on the envelope id. `EventCreated` carries the 'also post an announcement' intent (US-2.1) rather than Events calling Announcements synchronously — that keeps event creation independent of another service's availability.",
+  "oneOf": [
+    { "$ref": "#/definitions/EventCreated" },
+    { "$ref": "#/definitions/EventUpdated" },
+    { "$ref": "#/definitions/EventCancelled" },
+    { "$ref": "#/definitions/EventCompleted" }
+  ],
+  "definitions": {
+    "EventCreated": {
+      "type": "object",
+      "description": "A single event or a recurring series was published. Consumed by Announcements (Unit 9) when `announce` is true, and by Analytics.",
+      "properties": {
+        "eventId": { "type": "string" },
+        "seriesId": { "type": "string", "description": "Present instead of eventId for a series create" },
+        "title": { "type": "string" },
+        "groupId": { "type": ["string", "null"], "description": "null means community-wide" },
+        "type": { "type": "string" },
+        "startsAt": { "type": "string" },
+        "occurrences": { "type": "integer", "description": "Series creates only" },
+        "announce": { "type": "boolean", "description": "Creator asked for an announcement (US-2.1)" },
+        "announceByEmail": { "type": "boolean" },
+        "createdBy": { "type": "string" }
+      }
+    },
+    "EventUpdated": {
+      "type": "object",
+      "description": "Event details changed, or an auditable sub-resource action occurred (upload-link create/revoke, material quarantine). `notifyRsvps` tells Notifications to send an updated invite.",
+      "required": ["eventId"],
+      "properties": {
+        "eventId": { "type": "string" },
+        "title": { "type": "string" },
+        "startsAt": { "type": "string" },
+        "icsSequence": { "type": "integer", "description": "Must increase per change or calendar clients ignore the update" },
+        "notifyRsvps": { "type": "boolean" },
+        "kind": { "type": "string", "description": "upload-link-created | upload-link-revoked | material-quarantined" },
+        "linkId": { "type": "string" },
+        "materialId": { "type": "string" },
+        "actor": { "type": "string" },
+        "audit": { "type": "boolean", "description": "Audit-relevant action (US-1.13)" }
+      }
+    },
+    "EventCancelled": {
+      "type": "object",
+      "required": ["eventId"],
+      "properties": {
+        "eventId": { "type": "string" },
+        "title": { "type": "string" },
+        "groupId": { "type": ["string", "null"] },
+        "reason": { "type": "string", "description": "'group-deleted' when triggered by GroupSoftDeleted (BR-X3)" },
+        "notifyRsvps": { "type": "boolean" },
+        "icsSequence": { "type": "integer" }
+      }
+    },
+    "EventCompleted": {
+      "type": "object",
+      "required": ["eventId"],
+      "properties": {
+        "eventId": { "type": "string" },
+        "title": { "type": "string" },
+        "groupId": { "type": ["string", "null"] },
+        "type": { "type": "string" },
+        "attendedCount": { "type": "integer" }
+      }
+    }
+  }
+}

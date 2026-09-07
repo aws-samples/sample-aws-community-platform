@@ -1,0 +1,40 @@
+[project]
+name = "community-portal"
+version = "0.1.0"
+description = "AWS Community Portal — serverless microservices platform"
+requires-python = ">=3.12"
+
+# Backend services are self-contained (no shared library). This root config
+# provides shared DEV TOOLING config only (lint/test/type), not runtime deps.
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# `services/*/build` holds vendored third-party dependencies staged by
+# `make build`. Without excluding it, `make lint` reported ~16,650 findings in
+# other people's code the moment anyone ran a build (found 2026-08-05).
+extend-exclude = ["frontend", ".aws-sam", "dist", "build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]  # incl. bandit-style security (S)
+ignore = [
+  "E501",   # long lines are accepted house style in service code (dense dict/kwargs one-liners)
+  "UP017",  # datetime.UTC needs py3.11+; the local test runner is py3.10 (Lambda runtime is 3.12)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: asserts are the mechanism; fake credentials are fixtures, not secrets.
+"**/tests/**" = ["S101", "S105", "S106", "S107"]
+# Build tooling invokes pip/sam with fixed, non-user-controlled arguments.
+"platform/build/**" = ["S603", "S607"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+# Bare `pytest` runs platform only. Service suites MUST run one-process-per-service
+# (`make test`): services are self-contained with identical top-level module names
+# (models, app, ...), so collecting several in one interpreter poisons imports.
+testpaths = ["platform"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true

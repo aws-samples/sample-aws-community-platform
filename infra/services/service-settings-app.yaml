@@ -1,0 +1,432 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: App stack for settings (REAL Lambda + routes + role + alarms).
+Parameters:
+  Stage: { Type: String, Default: dev }
+  RestApiId: { Type: String }
+  # The private twin of RestApiId. Same route table, reachable only from
+  # inside the VPC through the execute-api interface endpoint.
+  PrivateRestApiId: { Type: String }
+  RootResourceId: { Type: String }
+  EventBusName: { Type: String }
+  EventBusArn: { Type: String, Default: '' }
+  TableName: { Type: String }
+  IdempotencyTableName: { Type: String }
+  FileShareBucketName: { Type: String, Default: '' }
+  FileShareBucketArn: { Type: String, Default: '' }
+  EnableSemanticSearch: { Type: String, Default: 'false' }
+  OpsAlarmTopicArn: { Type: String }
+  PrivateSubnetIds: { Type: CommaDelimitedList }
+  LambdaSecurityGroupId: { Type: String }
+  # CMK from the foundation stack for the log group(s) below. Required (no
+  # Default): an empty string is not a valid KmsKeyId, so a missing value must
+  # fail at deploy time rather than silently produce an unencrypted log group.
+  LogsKmsKeyArn: { Type: String }
+  # Managed policy from foundation granting DynamoDB-mediated use of the table
+  # CMK. Required (no Default): without it every DynamoDB call from these
+  # functions fails with a KMS AccessDenied once the key policy's wildcard
+  # statement is removed.
+  DynamoDbKmsAccessPolicyArn: { Type: String }
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 15
+    Tracing: Active
+Conditions:
+  HasBusArn: !Not [ !Equals [ !Ref EventBusArn, '' ] ]
+  # Keyed on the Arn (not the Name) so cfn-lint's condition-aware resolution can
+  # prove the Ref/Sub below never sees the empty default (root passes both or neither).
+  HasBucket: !Not [ !Equals [ !Ref FileShareBucketArn, '' ] ]
+Resources:
+  Fn:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "settings-${Stage}"
+      Handler: app.handler            # REAL handler (replaces mock_handler.handler)
+      CodeUri: ../../dist/settings.zip
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTableName
+          EVENT_BUS_NAME: !Ref EventBusName
+          FILE_SHARE_BUCKET: !Ref FileShareBucketName
+          ENABLE_SEMANTIC_SEARCH: !Ref EnableSemanticSearch
+          JOBS_STATE_MACHINE_ARN: !Ref JobsStateMachine
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - DynamoDBCrudPolicy: { TableName: !Ref TableName }
+        - DynamoDBCrudPolicy: { TableName: !Ref IdempotencyTableName }
+        - Statement:
+            - Sid: PublishDomainEvents
+              Effect: Allow
+              Action: events:PutEvents
+              Resource: !If [ HasBusArn, !Ref EventBusArn, !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EventBusName}" ]
+        - Statement:
+            - Sid: FileShareBroker
+              Effect: Allow
+              Action: [ s3:PutObject, s3:GetObject, s3:ListBucket ]
+              Resource: !If [ HasBucket, !Ref FileShareBucketArn, '*' ]
+            - Sid: FileShareBrokerObjects
+              Effect: Allow
+              # DeleteObject: hard Delete removes the slot's file (2026-08-04 rework).
+              Action: [ s3:PutObject, s3:GetObject, s3:DeleteObject ]
+              Resource: !If [ HasBucket, !Sub "${FileShareBucketArn}/*", '*' ]
+        - Statement:
+            - Sid: InvokeNightlyJobLambdas
+              Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:contributions-sweep-${Stage}"
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:certifications-${Stage}"
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:events-${Stage}"
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:identity-access-${Stage}"
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:member-profiles-${Stage}"
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:settings-job-runner-${Stage}"
+        - Statement:
+            - Sid: StartScheduledJobs
+              Effect: Allow
+              # "Run all" starts an execution; the page polls DescribeExecution to
+              # tell a genuinely-running batch from one that died without writing
+              # its final status. Scoped to this one machine.
+              Action: [ states:StartExecution, states:DescribeExecution ]
+              Resource: !Ref JobsStateMachine
+
+  # ----------------------------------------------------------------- job runner
+  # Dedicated function for on-demand nightly job execution. Invoked async by the
+  # main settings API; calls target Lambdas synchronously (RequestResponse) and
+  # writes completion status back to DynamoDB. Needs a long timeout: 900s covers
+  # the sequential opensearch-reindex job (identity-access + member-profiles,
+  # up to ~130s at 30k users) plus the heaviest single job (contributions-sweep
+  # at 300s), with generous headroom.
+  JobRunnerFn:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "settings-job-runner-${Stage}"
+      Handler: app.job_runner_handler
+      CodeUri: ../../dist/settings.zip
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      MemorySize: 256
+      Timeout: 900
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          STAGE: !Ref Stage
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - DynamoDBCrudPolicy: { TableName: !Ref TableName }
+        - Statement:
+            - Sid: InvokeTargetLambdas
+              Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:contributions-sweep-${Stage}"
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:certifications-${Stage}"
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:events-${Stage}"
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:identity-access-${Stage}"
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:member-profiles-${Stage}"
+  # ----------------------------------------------------------------- Scheduled-jobs orchestrator
+  #
+  # ONE entry point for both triggers (2026-08-27). The nightly rule and the
+  # "Run all" button both StartExecution on this machine, replacing two divergent
+  # code paths that each had their own copy of the already-running guard — one in
+  # NightlyJobsService.trigger_job, another in job_runner_handler's scheduled
+  # branch, each with its own 1800s stuck-run heuristic.
+  #
+  # WHY STEP FUNCTIONS AND NOT A LOOP IN THE RUNNER. JobRunnerFn caps at 900s and
+  # a full sequential pass is already plausibly 500-600s at 25k members, so the
+  # orchestration would eventually outgrow its own Lambda. A state machine has no
+  # such ceiling; only each individual job's timeout applies.
+  #
+  # DELIBERATELY GENERIC. The job list arrives in the execution input rather than
+  # being enumerated as states here, so JOB_REGISTRY stays the single source of
+  # truth. Hard-coding six Task states would mean every new job had to be added in
+  # two places, and the one that got forgotten would fail silently.
+  JobsStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "settings-scheduled-jobs-${Stage}"
+      Type: STANDARD
+      Role: !GetAtt JobsStateMachineRole.Arn
+      DefinitionSubstitutions:
+        JobRunnerArn: !GetAtt JobRunnerFn.Arn
+      Definition:
+        Comment: Runs the scheduled jobs in the order supplied by the caller.
+        StartAt: RunJobs
+        States:
+          RunJobs:
+            Type: Map
+            # MaxConcurrency 1 IS the sequencing. Ordering exists for load
+            # spreading, not correctness: no job reads what another writes
+            # (verified per job, 2026-08-27). Running six aggregation jobs at once
+            # against a 25k-member table is the thing being avoided.
+            MaxConcurrency: 1
+            ItemsPath: $.jobs
+            ResultPath: $.results
+            ItemProcessor:
+              ProcessorConfig: { Mode: INLINE }
+              StartAt: RunJob
+              States:
+                RunJob:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Parameters:
+                    FunctionName: ${JobRunnerArn}
+                    Payload.$: $
+                  # Retry TRANSIENT Lambda faults only. A job that failed on its
+                  # own data would just fail again, and retrying it would triple
+                  # the run time while reporting the same outcome.
+                  Retry:
+                    - ErrorEquals:
+                        - Lambda.ServiceException
+                        - Lambda.AWSLambdaException
+                        - Lambda.SdkClientException
+                        - Lambda.TooManyRequestsException
+                      IntervalSeconds: 5
+                      MaxAttempts: 2
+                      BackoffRate: 2
+                  # CONTINUE ON FAILURE. The jobs are independent, so stopping the
+                  # batch because one failed would withhold five unrelated results
+                  # for no reason. The runner has already written the failure to the
+                  # run record, so nothing is lost by proceeding.
+                  Catch:
+                    - ErrorEquals: [ States.ALL ]
+                      ResultPath: $.error
+                      Next: JobFailed
+                  End: true
+                JobFailed:
+                  Type: Pass
+                  End: true
+            Next: Finalize
+          Finalize:
+            # Marks the batch complete and clears the in-flight pointer. A separate
+            # state so it runs whether or not individual jobs failed — the batch
+            # itself finished either way, and leaving the pointer set would make the
+            # page show a spinner forever.
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${JobRunnerArn}
+              Payload:
+                finalizeBatchId.$: $.batchId
+            End: true
+
+  JobsStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref JobsStateMachineInvokePolicy
+
+  # Customer-managed rather than an inline `Policies` list on the role above:
+  # cfn-guard IAM_NO_INLINE_POLICY_CHECK (and AWS Config iam-no-inline-policy-check)
+  # reject inline policies on IAM roles however narrow they are. Permissions
+  # unchanged.
+  #
+  # Attached via the role's ManagedPolicyArns rather than this policy's `Roles`
+  # list so the attachment is part of the role's own creation: JobsStateMachine
+  # above takes !GetAtt JobsStateMachineRole.Arn, and a `Roles` list would let the
+  # machine be created against a role that cannot yet invoke the runner.
+  JobsStateMachineInvokePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      # ManagedPolicyName deliberately NOT set — an explicit name triggers cfn_nag
+      # W28 and Ref already returns the ARN.
+      Description: Invoke the settings job runner from the scheduled-jobs state machine.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Only the runner. The state machine never touches the job Lambdas
+          # directly — the runner owns result validation and status writes, so
+          # a path around it would bypass both.
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !GetAtt JobRunnerFn.Arn
+
+  # Nightly full pass. Replaces the three separate staggered rules that targeted
+  # JobRunnerFn per job; the state machine now spreads the load by running them one
+  # at a time instead of by clock offset.
+  ScheduledJobsNightly:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "settings-scheduled-jobs-nightly-${Stage}"
+      ScheduleExpression: "cron(0 3 * * ? *)"
+      State: ENABLED
+      Targets:
+        # Targets the settings FUNCTION, not the state machine. The rule's intent
+        # (below) was always that the service builds the job list — but until
+        # 2026-08-30 the target was !Ref JobsStateMachine, which skipped the
+        # service entirely. The machine's Map reads `$.jobs` and Finalize reads
+        # `$.batchId`; the static input carries neither, so every scheduled run
+        # failed immediately with States.ReferencePathConflict and the nightly
+        # jobs never ran. Confirmed against execution history: the only
+        # SUCCEEDED execution was a manual "Run all" from the admin page, which
+        # goes through start_batch() and therefore supplies a well-formed input.
+        # The function's dispatch() now has an explicit branch for this payload,
+        # and it already holds states:StartExecution on this machine.
+        - Id: scheduled-jobs
+          Arn: !GetAtt Fn.Arn
+          # The job list is built by the settings service and passed in, so this
+          # rule holds no job definitions to drift out of step with the registry.
+          Input: '{"source":"nightly"}'
+
+  # EventBridge -> Lambda is authorized by a resource policy on the function, not
+  # by a role on the rule (which is why ScheduledJobsNightlyRole, the old
+  # states:StartExecution role for the direct-to-state-machine target, is gone).
+  ScheduledJobsNightlyInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledJobsNightly.Arn
+
+  # S3 upload/delete events for the community file-share bucket (perf rework
+  # 2026-08-04). The listing reads a STORED `uploaded` flag instead of calling
+  # ListObjectsV2 once per folder, and this rule is what keeps that flag current.
+  # NOTE: no EventBusName — S3 notifications are delivered to the DEFAULT bus,
+  # unlike the platform's custom bus used for domain events.
+  FileShareObjectRule:
+    Type: AWS::Events::Rule
+    Condition: HasBucket
+    Properties:
+      Name: !Sub "settings-file-share-objects-${Stage}"
+      EventPattern:
+        source: [ aws.s3 ]
+        detail-type:
+          - Object Created
+          - Object Deleted
+        detail:
+          bucket:
+            name: [ !Ref FileShareBucketName ]
+          # KEY-PREFIX EXCLUSION added 2026-08-05 (Unit 4 finding F3). This
+          # bucket is now shared with other services, which write under their
+          # own prefixes. Without this filter Settings' consumer would receive
+          # every sibling object event, look for a FILEKEY pointer that does not
+          # exist, and burn an idempotency record per event — functionally
+          # tolerant, but it destroys this service's logs as a signal for its
+          # own feature. Each sibling's own rule carries the mirror-image
+          # prefix filter. `certifications/` added 2026-08-06 (Unit 6 finding
+          # F-A) — every future consumer of this bucket must be added here.
+          object:
+            key:
+              - anything-but:
+                  prefix:
+                    - "events/"
+                    - "certifications/"
+      State: ENABLED
+      Targets:
+        - Id: settings-file-share-object-consumer
+          Arn: !GetAtt Fn.Arn
+  FileShareObjectRulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasBucket
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FileShareObjectRule.Arn
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [ { Name: FunctionName, Value: !Ref Fn } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/*"
+  # Second permission, for the PRIVATE API. SourceArn pins a permission to a
+  # single api id, so the public one above does NOT cover requests arriving
+  # through the private API — without this they fail with API Gateway unable to
+  # invoke the function.
+  PrivateApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/*"
+
+  # ── Silent-degradation signals ────────────────────────────────────────────
+  # Every fail-soft path below logs a warning, substitutes a fallback and returns
+  # success, so without these the degradation is invisible: the caller gets a 200
+  # containing quietly wrong data. Added after finding 49 unnoticed membership-
+  # lookup timeouts in forums over four days.
+  #
+  # PLAIN-TEXT filter patterns on purpose. get_logger() attaches the JSON
+  # formatter only to the logger it names (propagate=False), so modules using
+  # logging.getLogger(__name__) emit Lambda's default TEXT format. A JSON
+  # { $.message = ... } pattern matches nothing there; a quoted substring matches
+  # both formats.
+  #
+  # Explicit log group because Lambda only auto-creates it on first invocation,
+  # so a metric filter cannot attach on a fresh install without it. It also
+  # replaces an auto-created group that had NO retention policy at all.
+  FnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/settings-${Stage}"
+      RetentionInDays: 30
+      KmsKeyId: !Ref LogsKmsKeyArn
+  LostDomainEventsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # a domain event was dropped after its write committed, so downstream projections diverge
+      FilterPattern: '?"event publish failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/Settings
+          MetricName: LostDomainEvents
+          MetricValue: '1'
+  LostDomainEventsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "a domain event was dropped after its write committed, so downstream projections diverge"
+      Namespace: Portal/Settings
+      MetricName: LostDomainEvents
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: absent data means no calls were attempted, NOT that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA when idle.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+Outputs:
+  FunctionArn: { Value: !GetAtt Fn.Arn }

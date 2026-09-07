@@ -1,0 +1,224 @@
+openapi: 3.0.3
+info: { title: Platform / Settings API, version: 2.1.0 }
+paths:
+  /settings:
+    get:
+      operationId: getSettings
+      description: Full admin settings (singleton). Any authenticated user may read it (Member/leader Settings pages display community name, timezone, etc.); only Administrators may write (see PUT).
+      responses:
+        '200': { description: Admin settings (singleton), content: { application/json: { schema: { $ref: '#/components/schemas/Settings' } } } }
+        '501': { $ref: '#/components/responses/NI' }
+    put:
+      operationId: updateSettings
+      description: Update settings (US-8.3/8.4/8.14 + self-registration toggle). Administrator only. Publishes SettingsChanged. Effective immediately for all readers.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Settings' } } } }
+      responses: { '200': { description: Saved, content: { application/json: { schema: { $ref: '#/components/schemas/Settings' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /public/settings:
+    get:
+      operationId: getPublicSettings
+      x-public: true
+      description: >
+        Unauthenticated subset of settings, readable BEFORE login (pre-auth) — and
+        therefore readable by ANYONE on the internet, since `/public` carries no
+        Cognito authorizer (same mechanism as `/auth`). Treat every field here as
+        world-readable and keep it to exactly what the login screen renders:
+        branding (communityName, logoUrl) and the Self-Registration tab gate
+        (selfRegistrationEnabled, US-1.30).
+        TRIMMED 2026-08-28: previously also returned defaultTimezone,
+        allowedEmailDomains and otpIntervalDays. No pre-login caller read them —
+        AuthScreen.tsx destructures only the three above — but anonymous callers
+        could learn which corporate domains may self-register (targeting recon)
+        and how long a departed employee's access persists before OTP
+        re-verification. Those moved to GET /internal/settings, which exists only
+        on the PRIVATE API. Server-side enforcement of the allow-list and OTP
+        interval in Identity & Access reads that route now.
+      responses:
+        '200': { description: Public settings subset, content: { application/json: { schema: { $ref: '#/components/schemas/PublicSettings' } } } }
+        '501': { $ref: '#/components/responses/NI' }
+  /internal/settings:
+    get:
+      operationId: getInternalSettings
+      x-private-only: true
+      description: >
+        Admin config that other services need server-side but that must NOT be
+        disclosed pre-login. Emitted ONLY into the private REST API (see
+        PRIVATE_ONLY_BASES in infra/tools/gen_api_edge.py), so there is no
+        internet path to it: the private API is reachable only via the
+        execute-api interface endpoint and its resource policy denies any
+        principal not arriving through that VPCE.
+        Carries no Cognito authorizer by design — callers are Lambdas in this
+        account making same-account HTTP calls with no JWT to present. Network
+        isolation is the control, not a token.
+        Consumers: Identity & Access (allowedEmailDomains, selfRegistrationEnabled,
+        otpIntervalDays — BR-P3 allow-list and US-1.32 OTP interval) and Events
+        (teamsEnabled — BR-T1 capability gate). Events previously read
+        teamsEnabled from /public/settings where the field was never present, so
+        it resolved to the `False` default on every call and never consulted the
+        store. That produced the right answer regardless, because MS Teams is
+        locked OFF by platform policy server-side (update_settings forces
+        teamsEnabled=False), but it was dead wiring; the field now travels.
+      responses:
+        '200': { description: Internal settings subset, content: { application/json: { schema: { $ref: '#/components/schemas/InternalSettings' } } } }
+        '501': { $ref: '#/components/responses/NI' }
+  /settings/email-templates:
+    get:
+      operationId: listEmailTemplates
+      x-mock-collection: emailTemplates
+      responses: { '200': { description: Templates, content: { application/json: { schema: { $ref: '#/components/schemas/TemplateList' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /settings/email-templates/{id}:
+    put:
+      operationId: updateEmailTemplate
+      x-mock-collection: emailTemplates
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { subject: { type: string }, body: { type: string } } } } } }
+      responses: { '200': { description: Saved, content: { application/json: { schema: { $ref: '#/components/schemas/Template' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /settings/nightly-jobs:
+    get:
+      operationId: listNightlyJobs
+      description: >-
+        The Scheduled Jobs page (Administrators and Community Leaders). Returns one entry per job
+        in EXECUTION ORDER, so the list reads in the sequence a run actually follows — a page that
+        orders them differently invites the reader to assume a dependency that does not exist.
+        `nextRunAt` is the EARLIEST of the nightly batch and the job's own extra schedule: three
+        jobs keep independent EventBridge rules in their own service templates, so for them the
+        batch is not the whole story. `lastRun` is a per-job pointer lookup (one GetItem), replacing
+        an index scan that read the 50 most recent runs across ALL jobs and filtered in memory — with
+        six jobs per batch that covered roughly eight batches, so a job outside that window reported
+        "never run" while its history sat in the table.
+      responses: { '200': { description: Jobs with schedule and last-run status, content: { application/json: { schema: { $ref: '#/components/schemas/JobList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /settings/nightly-jobs/run:
+    post:
+      operationId: startJobBatch
+      description: >-
+        Start ONE sequential run of every job and return immediately (additive 2026-08-27).
+        There is deliberately no per-job trigger: the previous
+        POST /settings/nightly-jobs/{id}/trigger fanned out its own async invocation per job, so any
+        caller using it bypassed the ordering the state machine exists to guarantee.
+        Asynchronous by necessity, not preference — a full pass is minutes of work, well past API
+        Gateway's 29s ceiling, so the response can only ever be a receipt. Poll
+        /settings/nightly-jobs/batch/{id}, or read `activeBatch` on the listing after navigating away.
+        Idempotent through the Step Functions execution name: a duplicate is rejected with
+        ExecutionAlreadyExists, so two rapid clicks cannot start two batches.
+        A job failing does NOT abort the batch — the jobs are independent (no job reads what another
+        writes), so stopping would withhold five unrelated results for no reason.
+      responses: { '202': { description: Batch accepted and queued, content: { application/json: { schema: { $ref: '#/components/schemas/JobBatch' } } } }, '400': { description: 'A run is already in progress, or orchestration is not configured', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /settings/nightly-jobs/batch/{id}:
+    get:
+      operationId: getJobBatch
+      description: >-
+        Progress for one batch. The page polls this while a run is in flight and stops when
+        `status` leaves `running`. All state is server-side, so closing the page and returning
+        later shows the current position rather than losing it.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { '200': { description: Batch progress, content: { application/json: { schema: { $ref: '#/components/schemas/JobBatch' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+  /settings/file-share:
+    get:
+      operationId: listFileShareLinks
+      x-mock-collection: fileShareLinks
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200 }, description: "Page size (perf rework 2026-08-04). Omit for the full unpaged listing." }
+        - { name: cursor, in: query, required: false, schema: { type: string }, description: "Opaque cursor from a previous response. Invalid cursors return 400." }
+      description: File slots created by the caller (CL sees all; UGL sees own — enforced in-service). US-8.13. One record = one file slot (folder + fileName); no expiry — a slot lives until deleted (user-approved deviation, 2026-08-04).
+      responses: { '200': { description: Links, content: { application/json: { schema: { $ref: '#/components/schemas/FileShareLinkList' } } } }, '501': { $ref: '#/components/responses/NI' } }
+    post:
+      operationId: createFileShareLink
+      x-mock-collection: fileShareLinks
+      description: Create a file slot in the predefined community bucket (leaders never choose buckets). fileName must be unique within the folder (409 otherwise). CL/UGL only. No presigned URL is minted or stored here — see getFileShareUploadUrl.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [folder, fileName], properties: { folder: { type: string }, fileName: { type: string }, note: { type: string } } } } } }
+      responses: { '201': { description: Link created, content: { application/json: { schema: { $ref: '#/components/schemas/FileShareLink' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+  /settings/file-share/folders:
+    get:
+      operationId: listFileShareFolders
+      x-mock-collection: fileShareFolders
+      description: Predefined bucket name + existing folders (union of link-record folders and bucket top-level prefixes) for the Create Share Link folder selector. CL/UGL only.
+      responses: { '200': { description: Bucket and folders, content: { application/json: { schema: { $ref: '#/components/schemas/FileShareFolderList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /settings/file-share/{id}/upload-url:
+    get:
+      operationId: getFileShareUploadUrl
+      x-mock-collection: fileShareUploadUrls
+      description: Mint a FRESH short-lived (1 hour) presigned PUT URL for this slot's exact key and return it with a ready-to-run curl command (what Copy Link copies). Checked against `revoked` at mint time, so Delete immediately stops new URLs; an already-issued URL lives out its remaining <=1h (accepted deviation). CL any active slot; UGL own slots only.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Fresh upload URL, content: { application/json: { schema: { $ref: '#/components/schemas/FileShareUploadUrl' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+  /settings/file-share/{id}/files:
+    get:
+      operationId: listFileShareFiles
+      x-mock-collection: fileShareFiles
+      description: Owner-side folder view (US-8.13 view/download) — objects in the slot's folder with fresh 5-minute presigned GET download URLs (never stored). CL any slot; UGL own slots only.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Folder contents, content: { application/json: { schema: { $ref: '#/components/schemas/FileShareFileList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+  /settings/file-share/{id}:
+    delete:
+      operationId: deleteFileShareLink
+      x-mock-collection: fileShareLinks
+      description: Permanently delete a slot AND its uploaded file from the bucket (user decision 2026-08-04 — supersedes the earlier files-remain behavior). The row disappears from the listing. CL any; UGL own.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: Deleted (link record and file removed) }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+  /settings/file-share/{id}/revoke:
+    post:
+      operationId: revokeFileShareLink
+      x-mock-collection: fileShareLinks
+      description: DEACTIVATE a slot — immediately stops minting new upload URLs (Copy Link disabled in the UI). The record and any uploaded file remain; use DELETE to remove both. CL any; UGL own.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Deactivated, content: { application/json: { schema: { $ref: '#/components/schemas/FileShareLink' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+components:
+  responses:
+    Forbidden: { description: Forbidden, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: Not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Conflict: { description: Conflict (duplicate fileName in folder), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NI: { description: Not yet implemented, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  schemas:
+    Settings:
+      type: object
+      properties:
+        communityName: { type: string }
+        logoUrl: { type: string }
+        defaultTimezone: { type: string }
+        enableSemanticSearch: { type: boolean }
+        selfRegistrationEnabled: { type: boolean, description: "US-1.30 master switch. Default true. When false, the Self-Registration tab/section is hidden portal-wide and the backend rejects /auth/register." }
+        allowedEmailDomains: { type: array, items: { type: string }, description: "Self-registration allow-list (US-1.30, US-8.3). Empty list blocks self-registration even if the flag is on." }
+        otpIntervalDays: { type: integer, description: "US-1.32 admin-configurable OTP re-verification interval." }
+        teamsEnabled: { type: boolean }
+        teamsTenantId: { type: string }
+        llmDuplicateDetectionEnabled: { type: boolean }
+        bedrockModel: { type: string }
+        whatsNewEnabled: { type: boolean }
+        whatsNewFeedUrl: { type: string }
+        senderName: { type: string }
+        senderEmail: { type: string }
+    PublicSettings:
+      description: >
+        WORLD-READABLE. Served unauthenticated from /public/settings. Add a field
+        here only if the pre-login UI actually renders it.
+      type: object
+      properties:
+        communityName: { type: string }
+        logoUrl: { type: string }
+        selfRegistrationEnabled: { type: boolean }
+    InternalSettings:
+      description: >
+        Private-API-only. Admin config other services enforce server-side.
+        selfRegistrationEnabled is intentionally in BOTH this and PublicSettings:
+        the SPA needs it to show/hide the Self-Registration tab, and Identity &
+        Access needs it to actually reject registrations (defense in depth — the
+        client-visible flag is not the enforcement point).
+      type: object
+      properties:
+        selfRegistrationEnabled: { type: boolean }
+        allowedEmailDomains: { type: array, items: { type: string } }
+        otpIntervalDays: { type: integer }
+        teamsEnabled: { type: boolean }
+        defaultTimezone: { type: string }
+    Template: { type: object, required: [id, name], properties: { id: { type: string }, name: { type: string }, subject: { type: string }, body: { type: string } } }
+    TemplateList: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/Template' } }, count: { type: integer } } }
+    FileShareLink: { type: object, required: [id, folder, fileName, revoked], properties: { id: { type: string }, folder: { type: string }, fileName: { type: string }, key: { type: string, description: "S3 object key = <folder>/<fileName>" }, note: { type: string }, createdBy: { type: string }, createdByEmail: { type: string, description: "Creator's email, denormalized at create time so the Community Leader listing can show Created By without a per-row lookup. Empty on records created before 2026-08-04." }, createdAt: { type: string }, revoked: { type: boolean }, uploaded: { type: boolean, description: "Whether the file exists in the bucket. STORED and maintained by the S3 Object Created/Deleted consumer (perf rework 2026-08-04); previously computed per request." }, sizeBytes: { type: integer, description: "Size of the uploaded object; absent until an upload arrives." }, uploadedAt: { type: string, description: "When the upload was observed; absent until an upload arrives." } } }
+    FileShareLinkList: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/FileShareLink' } }, count: { type: integer }, cursor: { type: string, description: "Present when a further page exists; pass back as ?cursor=." } } }
+    FileShareFolderList: { type: object, required: [bucket, folders], properties: { bucket: { type: string, description: "Predefined community bucket (foundation FileShareBucket) — readonly in the UI." }, folders: { type: array, items: { type: string } } } }
+    FileShareUploadUrl: { type: object, required: [url, key, fileName, expiresInSeconds, curl], properties: { url: { type: string, description: "Fresh presigned PUT URL, single key, ~1h life." }, key: { type: string }, fileName: { type: string }, expiresInSeconds: { type: integer }, curl: { type: string, description: "Ready-to-run upload command — this is what Copy Link places on the clipboard." } } }
+    FileShareFile: { type: object, required: [name, sizeBytes], properties: { name: { type: string }, sizeBytes: { type: integer }, uploadedAt: { type: string }, downloadUrl: { type: string, description: "Fresh presigned GET, ~5 min life, never stored." } } }
+    FileShareFileList: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/FileShareFile' } }, count: { type: integer } } }
+    JobRun: { type: object, required: [runId, jobId, status], properties: { runId: { type: string }, jobId: { type: string }, status: { type: string, enum: [queued, running, completed, failed], description: "`queued` exists because the batch runs jobs one at a time: without it, jobs further down the sequence are indistinguishable from never-run and the operator reasonably concludes they are broken." }, startedAt: { type: string }, completedAt: { type: string, nullable: true }, result: { type: object, nullable: true, additionalProperties: true, description: "What the job reported. A run only counts as completed if this carries the job's declared key — `FunctionError` alone cannot detect failure, because every service handler is wrapped so no exception escapes and an internal error comes back as a 200-shaped envelope." }, error: { type: string, nullable: true }, batchId: { type: string, description: "The batch this run belongs to, when it was part of one." } } }
+    Job: { type: object, required: [id, label, description], properties: { id: { type: string }, label: { type: string }, description: { type: string, description: "What the job is FOR, in an operator's terms — shown on the card." }, batchSchedule: { type: string, description: "Human wording for when the whole batch runs, e.g. 'Daily at 03:00 UTC'." }, ownSchedule: { type: string, nullable: true, description: "This job's own additional schedule where it has one (e.g. 'Every 15 minutes' for the scan watchdog). Null for jobs that run only as part of the batch." }, nextRunAt: { type: string, nullable: true, description: "Earliest of the batch and ownSchedule. Null when the schedule expression is not one of the two recognised shapes — reported as unknown rather than guessed." }, lastRun: { $ref: '#/components/schemas/JobRun' } } }
+    JobList: { type: object, required: [items], properties: { items: { type: array, items: { $ref: '#/components/schemas/Job' } }, batchSchedule: { type: string }, batchNextRunAt: { type: string, nullable: true }, activeBatch: { $ref: '#/components/schemas/JobBatch' } } }
+    JobBatch: { type: object, required: [batchId, status], properties: { batchId: { type: string }, status: { type: string, enum: [running, completed, failed] }, startedAt: { type: string }, completedAt: { type: string, nullable: true }, order: { type: array, items: { type: string }, description: "Job ids in the sequence this batch executes." }, currentIndex: { type: integer, description: "How many jobs have reached a terminal state. Derived rather than incremented, so a retried step cannot double-count it." }, jobs: { type: object, additionalProperties: true, description: "jobId -> {status, runId, completedAt, error}." }, failedJobs: { type: array, items: { type: string }, description: "Set when the batch finalises. Non-empty does not mean the batch failed — the jobs are independent and the rest still ran." } } }
+    Error: { type: object, required: [code, message], properties: { code: { type: string }, message: { type: string }, correlationId: { type: string } } }

@@ -1,0 +1,231 @@
+openapi: 3.0.3
+info: { title: Member Profiles & Directory API, version: 1.0.0 }
+paths:
+  /members:
+    get:
+      operationId: browseDirectory
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: "Search text (name/email/skills). Delegates to Search when EnableSemanticSearch is on; keyword substring match otherwise (US-3.5)." }
+        - { name: role, in: query, schema: { type: string } }
+        - { name: groupId, in: query, schema: { type: string } }
+        - { name: certId, in: query, schema: { type: string }, description: "Omitted/ignored for Community-Leader-facing directory (US-3.5)." }
+        - { name: limit, in: query, schema: { type: integer } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Directory rows
+          content: { application/json: { schema: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/Member' } }, count: { type: integer }, cursor: { type: string } } } } }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /members/me:
+    get:
+      operationId: getOwnProfile
+      responses:
+        '200': { description: Profile, content: { application/json: { schema: { $ref: '#/components/schemas/Member' } } } }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+    put:
+      operationId: updateOwnProfile
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { city: { type: string, maxLength: 500 }, country: { type: string, maxLength: 500 }, professionalRole: { type: string, maxLength: 500 }, timezone: { type: string }, bio: { type: string, maxLength: 2000 }, skills: { type: array, items: { type: string, maxLength: 60 } }, avatar: { type: string, maxLength: 500 }, awsProject: { type: boolean } } } } } }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Member' } } } }
+        '400': { description: Validation error, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /members/me/avatar-upload:
+    post:
+      operationId: grantAvatarUpload
+      summary: Mint a presigned POST to upload a profile picture to the dedicated avatar bucket (US-3.2)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [fileName, contentType, sizeBytes], properties: { fileName: { type: string }, contentType: { type: string, enum: [image/png, image/jpeg, image/webp] }, sizeBytes: { type: integer, description: "Max 5 MB" } } } } } }
+      responses:
+        '200':
+          description: Presigned POST grant
+          content: { application/json: { schema: { type: object, required: [url, fields, key, avatarUrl], properties: { url: { type: string }, fields: { type: object, additionalProperties: { type: string } }, key: { type: string }, avatarUrl: { type: string, description: "Public https URL to save on the profile once uploaded" }, expiresInSeconds: { type: integer } } } } }
+        '400': { description: Validation error, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /members/export:
+    post:
+      operationId: startDirectoryExport
+      summary: Start an async CSV export of the Member Directory (US-3.4/3.5 export action)
+      description: >
+        Returns 202 immediately with a job id; the CSV is built by a worker Lambda and
+        collected via getDirectoryExport. Asynchronous because a synchronous export cannot
+        work at this scale for two independent reasons: the listing exceeds API Gateway's
+        hard 29s integration timeout, and the JSON response exceeds Lambda's 6MB payload
+        limit past roughly 20k members. RESTRICTED TO CommunityLeader AND UserGroupLeader —
+        note GET /members itself is open to any authenticated principal, so without this
+        gate any Member could download the entire directory (every name and email) as a
+        file. Administrators are excluded; they have the richer Admin > Users export in
+        identity-access. Honours the same q/role/groupId filters as browseDirectory so the
+        CSV matches the filtered table; certId is NOT supported because resolving cert
+        holders needs a fan-out with the caller's token, which the worker does not have.
+        Rows are read from the OpenSearch index, so an export reflects the INDEX and can
+        lag the roster. At most one export runs per leader at a time.
+      requestBody:
+        required: false
+        content: { application/json: { schema: { type: object, properties: { q: { type: string, description: "Free-text match on name, email, professional role, bio or skills." }, role: { type: string, enum: [Member, UserGroupLeader, CommunityLeader] }, groupId: { type: string } } } } }
+      responses:
+        '202': { description: Export accepted and queued, content: { application/json: { schema: { $ref: '#/components/schemas/DirectoryExportJob' } } } }
+        '400': { description: An export is already running for this leader, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /members/export/{id}:
+    get:
+      operationId: getDirectoryExport
+      summary: Progress and result of a directory export job, polled by the SPA
+      description: >
+        Once status is `ready` the response carries a freshly minted, short-lived presigned
+        download URL — generated per request and never stored, so a stale response cannot be
+        replayed. Scoped to the requesting leader; another leader's job id is reported as not
+        found rather than forbidden, so the response cannot confirm it exists. The generated
+        file is removed by a 1-day bucket lifecycle rule (there is no delete-on-download: a
+        presigned GET is a direct browser-to-S3 transfer the service never observes completing).
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "Export job id returned by startDirectoryExport." }]
+      responses:
+        '200': { description: Export job status, content: { application/json: { schema: { $ref: '#/components/schemas/DirectoryExportJob' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /members/{id}:
+    get:
+      operationId: getMember
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Profile, content: { application/json: { schema: { $ref: '#/components/schemas/Member' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /members/{id}/activity:
+    get:
+      operationId: memberActivity
+      x-mock-collection: activity
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string } }
+        - { name: to, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Detailed activity summary (leader-only, US-3.10)
+          content: { application/json: { schema: { type: object, required: [items, count], properties: { items: { type: array, items: { type: object } }, count: { type: integer }, points: { type: object, properties: { currentQuarter: { type: integer }, lifetime: { type: integer } } } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  # Shoutouts (US-13). These routes were live in infra/api-edge.yaml and in
+  # services/member-profiles/src/shoutout_service.py but were MISSING from this
+  # contract, so regenerating the API Edge template silently deleted them. They
+  # are documented here to restore contracts-as-source-of-truth (NFR-MAINT-2)
+  # and to bring the surface under Schemathesis coverage, which it never had.
+  /shoutouts:
+    post:
+      operationId: sendShoutout
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [recipientId, message], properties: { recipientId: { type: string, description: "Member receiving the shoutout. Must not be the caller." }, message: { type: string, maxLength: 280 } } } } }
+      responses:
+        '201': { description: Shoutout sent, content: { application/json: { schema: { $ref: '#/components/schemas/Shoutout' } } } }
+        '400': { description: "Validation error — self-shoutout, recipient is not a Member, message empty or over 280 chars, weekly quota exhausted, or already sent to this recipient this week", content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /shoutouts/recent:
+    get:
+      operationId: recentShoutouts
+      description: "Home page feed: last 7 days, capped at 5. Unpaginated by design, so no cursor is returned."
+      responses:
+        '200': { description: Recent shoutouts, content: { application/json: { schema: { $ref: '#/components/schemas/ShoutoutFeed' } } } }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /shoutouts/all:
+    get:
+      operationId: allShoutouts
+      description: "Full paginated feed, last 30 days."
+      parameters:
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 50 }, description: "Clamped server-side to 1-50." }
+      responses:
+        '200': { description: Shoutout feed, content: { application/json: { schema: { $ref: '#/components/schemas/ShoutoutFeed' } } } }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /shoutouts/my-sent:
+    get:
+      operationId: mySentShoutouts
+      description: "Shoutouts sent by the caller, last 30 days."
+      parameters:
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 50 } }
+      responses:
+        '200': { description: Shoutouts sent by the caller, content: { application/json: { schema: { $ref: '#/components/schemas/ShoutoutFeed' } } } }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /shoutouts/my-received:
+    get:
+      operationId: myReceivedShoutouts
+      parameters:
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 50 } }
+      responses:
+        '200': { description: Shoutouts received by the caller, content: { application/json: { schema: { $ref: '#/components/schemas/ShoutoutFeed' } } } }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /shoutouts/quota:
+    get:
+      operationId: shoutoutQuota
+      description: "Remaining weekly allowance for the caller. Quotas are role-based and read from Settings, so the figure is time-varying and deliberately not part of the Member payload."
+      responses:
+        '200':
+          description: Weekly shoutout allowance
+          content: { application/json: { schema: { type: object, required: [remaining, limit], properties: { remaining: { type: integer, description: "Never negative, even if the quota was lowered after the caller had already sent more than the new limit." }, limit: { type: integer }, sent: { type: integer, description: "Sent since Monday. Absent when the caller's role cannot send shoutouts at all, in which case remaining and limit are both 0." } } } } }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /shoutouts/member/{id}:
+    get:
+      operationId: memberShoutouts
+      description: "Shoutouts received by a specific member, for the profile view. NOTE: accepts no pagination parameters, so it returns at most the first 20. The response may still carry a cursor that this endpoint gives the caller no way to use."
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Shoutouts received by the member, content: { application/json: { schema: { $ref: '#/components/schemas/ShoutoutFeed' } } } }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /shoutouts/{id}:
+    delete:
+      operationId: deleteShoutout
+      description: "Sender or a CommunityLeader only."
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /shoutouts/{id}/react:
+    post:
+      operationId: reactShoutout
+      description: "Toggles the caller's applause reaction and returns the resulting state."
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: New reaction state, content: { application/json: { schema: { type: object, required: [reacted, reactionCount], properties: { reacted: { type: boolean, description: "Whether the caller's reaction is now present." }, reactionCount: { type: integer } } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+components:
+  responses:
+    NotFound: { description: Not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Forbidden: { description: Forbidden, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotImplemented: { description: Not yet implemented, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  schemas:
+    DirectoryExportJob: { type: object, required: [jobId, status], properties: { jobId: { type: string }, status: { type: string, enum: [queued, running, ready, failed] }, processed: { type: integer, description: "Rows written so far." }, total: { type: integer, nullable: true, description: "Exact number of matching members, counted once when the job starts. Null when the search index is unavailable, in which case the client shows an indeterminate progress bar rather than a fabricated figure. On completion this is reconciled to the rows actually written, so a finished export always reads 100%." }, percent: { type: integer, nullable: true, description: "Clamped 0-100 progress derived from processed/total. Null when total is unknown. Clamped because members can be created while the export runs." }, fileName: { type: string, description: "Suggested download filename, timestamped so successive exports do not overwrite each other." }, url: { type: string, description: "Presigned download URL. Present only when status is ready; minted per request and never stored." }, expiresInSeconds: { type: integer, description: "Lifetime of the presigned URL (present alongside url)." }, error: { type: string, description: "Present only when status is failed. Deliberately generic — exception detail is logged, not returned." } } }
+    Shoutout: { type: object, required: [id, recipientId, senderId, message, createdAt, reactionCount], properties: { id: { type: string }, recipientId: { type: string }, recipientName: { type: string, description: "Denormalised at send time. Falls back to recipientId if the profile carried no name." }, recipientAvatar: { type: string, description: "Empty string when the recipient has no avatar." }, recipientGroupId: { type: string, description: "The recipient's primary (first) group. Empty when they belong to none." }, recipientGroupName: { type: string, description: "Resolved via fan-out to Forums at send time and denormalised. Falls back to recipientGroupId when that lookup fails, so this can legitimately hold an id rather than a name." }, senderId: { type: string }, senderName: { type: string }, senderRole: { type: string }, isLeaderPick: { type: boolean, description: "True when the sender was a CommunityLeader or UserGroupLeader, letting the UI badge leader shoutouts. Frozen at send time, so it does not change if the sender's role later changes." }, message: { type: string, maxLength: 280 }, createdAt: { type: string, format: date-time }, reactionCount: { type: integer } } }
+    ShoutoutFeed: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/Shoutout' } }, count: { type: integer, description: "Number of items in THIS page, not the total available." }, cursor: { type: string, description: "Opaque continuation token. Present only when a further page exists." } } }
+    Member:
+      type: object
+      required: [id, firstName, lastName, role, status]
+      properties:
+        id: { type: string }
+        firstName: { type: string }
+        lastName: { type: string }
+        email: { type: string }
+        role: { type: string }
+        status: { type: string, enum: [active, inactive] }
+        memberGroupIds: { type: array, items: { type: string } }
+        groups: { type: array, items: { type: object, properties: { groupId: { type: string }, joinedAt: { type: string } } }, description: "Per-group join dates (US-3.1/3.3/3.4), mirrored from Identity & Access membership events." }
+        city: { type: string }
+        country: { type: string }
+        professionalRole: { type: string }
+        awsProject: { type: boolean }
+        timezone: { type: string }
+        bio: { type: string, maxLength: 2000 }
+        skills: { type: array, items: { type: string, maxLength: 60 } }
+        avatar: { type: string }
+        rollup: { type: object, properties: { points: { type: integer }, quarter: { type: string } }, description: "Display-only current-quarter rollup across all groups (BR-1). No tier meaning." }
+        tiers: { type: array, items: { type: object, properties: { groupId: { type: string }, tier: { type: string } } } }
+        activitySummary: { type: object, properties: { eventsAttended: { type: integer }, forumPosts: { type: integer }, contributions: { type: integer }, certifications: { type: integer } }, description: "Basic inline activity-count block (no points), shown on any profile view (BR-12)." }
+        canShoutout: { type: boolean, description: "Whether the CALLING user may send this member a shoutout (US-13.1/13.2/13.11): recipient must be a Member, never the caller themselves, and a UserGroupLeader only within their led group. Excludes weekly quota, which is time-varying and reported by the send endpoint. Present on both the profile payload and directory rows so the UI never re-derives the rule." }
+    Error: { type: object, required: [code, message], properties: { code: { type: string }, message: { type: string }, correlationId: { type: string }, details: { type: array, items: { type: object, properties: { field: { type: string }, message: { type: string } } }, description: "Per-field validation failures — surfaced to the user (e.g. 'bio: length must be 1-2000')." } } }

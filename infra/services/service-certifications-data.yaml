@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Data stack for certifications (tables + streams + idempotency). DeletionPolicy Retain.
+Parameters:
+  Stage: { Type: String, Default: dev }
+  # CMK from the foundation stack. Required (no Default): an empty string is
+  # not a valid KMSMasterKeyId, so a missing value must fail at deploy time
+  # rather than silently fall back to the AWS managed key.
+  DynamoDbKmsKeyArn: { Type: String }
+# DeletionPolicy / UpdateReplacePolicy are Retain on every table below.
+#
+# They were BOTH `Delete` until 2026-08-30, while this template's own Description
+# said "DeletionPolicy Retain" -- documented one way, configured the other.
+#
+# Why it matters here specifically: these tables are explicitly named (architecture
+# decision D1), which is exactly what cfn_nag W28 warns about. An explicitly-named
+# resource cannot be replaced in place, so CloudFormation has to DELETE the old one
+# first. With Delete that made any replacing update, stack delete or rollback a
+# data-loss event -- across the estate roughly 380k items, the largest single table
+# holding ~190k. PITR is enabled so it was recoverable, but restoring a table plus
+# its GSIs is an incident, not a no-op.
+#
+# Deliberate consequence: Retain plus an explicit name means a replacing update now
+# FAILS with "table already exists" rather than silently destroying rows. That is a
+# hard stop requiring manual intervention, and it is the correct trade.
+# DeletionProtectionEnabled complements the Retain policies above; it does not
+# duplicate them. Retain is a promise CloudFormation makes to ITSELF -- it stops the
+# stack deleting or replacing a table. It does nothing about a plain
+# `aws dynamodb delete-table`, where the rows go regardless. Deletion protection is
+# enforced by the DynamoDB service, so the table cannot be deleted by anyone,
+# irrespective of IAM.
+#
+# It protects the TABLE, not the data: PutItem/UpdateItem/DeleteItem and TTL expiry
+# all still work. This is an anti-accident control, not data integrity.
+#
+# Teardown cost, since these are dev stacks: the tables already survive a stack
+# delete because of Retain, so they were always going to be removed by hand. This
+# adds one unlock step before that --
+#   aws dynamodb update-table --table-name <n> --no-deletion-protection-enabled
+# -- or flip this to false here and deploy, which is an in-place Modify with no
+# replacement. Set through CloudFormation rather than the CLI so a fresh account gets
+# it too; the VPC default-security-group lockdown noted in foundation.yaml is the
+# cautionary example of a hand-applied hardening that does not reproduce.
+#
+# Also satisfies Security Hub DynamoDB.6 and the AWS Config managed rule
+# dynamodb-table-deletion-protection-enabled.
+Resources:
+  Table:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # No explicit TableName (cfn_nag W28). CloudFormation generates the name
+      # and the stack Output below passes it on, so nothing needs to know it at
+      # author time. Retain policies are kept, so a future replacing update
+      # ORPHANS this table rather than deleting it -- new table comes up EMPTY.
+      DeletionProtectionEnabled: true
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      # SSEType KMS + an explicit KMSMasterKeyId is what moves this table off
+      # alias/aws/dynamodb (which is what a bare SSEEnabled: true selects) and
+      # onto the customer-managed key. All three sub-properties are
+      # No-interruption updates, so this does NOT replace the table.
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DynamoDbKmsKeyArn
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: gsi1pk, AttributeType: S }
+        - { AttributeName: gsi1sk, AttributeType: S }
+        - { AttributeName: gsi2pk, AttributeType: S }
+        - { AttributeName: gsi2sk, AttributeType: S }
+        - { AttributeName: gsi3pk, AttributeType: S }
+        - { AttributeName: gsi3sk, AttributeType: S }
+        - { AttributeName: gsi4pk, AttributeType: S }
+        - { AttributeName: gsi4sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        # DEPLOYMENT NOTE (finding F-C, mirrors Events F2): DynamoDB permits ONE
+        # GSI creation per UpdateTable — going 0->3 needs THREE sequential
+        # deployments, staged with infra/tools/stage_gsis.py certifications 1;
+        # then 1 2; then 1 2 3. Poll DescribeTable until each index is ACTIVE
+        # (wait_for_gsi.sh): the stack reports UPDATE_COMPLETE while an index is
+        # still CREATING and a Query against a backfilling index FAILS.
+        # GSI1 - a member's claims. MEMBER#<memberId> / <submittedAt>#<claimId>.
+        # Serves myClaims, badges, and member-profiles' deployed fan-out reads.
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: gsi1pk, KeyType: HASH }
+            - { AttributeName: gsi1sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        # GSI2 - verification queue. SPARSE single partition PENDING/<submittedAt>:
+        # only Pending claims carry the key (removed on the terminal transition
+        # itself), so oldest-first is the index order and queue cost tracks the
+        # transient pending set, not table size (J2).
+        - IndexName: GSI2
+          KeySchema:
+            - { AttributeName: gsi2pk, KeyType: HASH }
+            - { AttributeName: gsi2sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        # GSI3 - shared sweep index (J3): partition EXPIRY (Approved+expiring,
+        # sort=expiresAt, daily sweep) or SCANWATCH (PendingScan claims,
+        # sort=submittedAt, 15-min watchdog). One GSI hosting both windows
+        # halves the staged-deployment count.
+        - IndexName: GSI3
+          KeySchema:
+            - { AttributeName: gsi3pk, KeyType: HASH }
+            - { AttributeName: gsi3sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        # GSI4 - granted ledger (Certification Ledger + dashboard charts, 2026-08-12).
+        # SPARSE: only granted claims (Approved/Expired/Revoked) carry the keys;
+        # written at approval and RETAINED through the terminal transitions to
+        # Expired/Revoked (BR-L6), so history stays queryable. Partition per
+        # earned-quarter (GLED#<YYYY-Qn>), sort <earnedDate>#<claimId> — the ledger
+        # reads one quarter partition, newest-earned-first, paginated. Charts read
+        # rollup COUNTER items (CROLL#/CROLLC#) in the base table, NOT this index.
+        # STAGING: this is a single UpdateTable (3->4). Poll wait_for_gsi.sh until
+        # GSI4 is ACTIVE before querying (UPDATE_COMPLETE fires while it builds).
+        - IndexName: GSI4
+          KeySchema:
+            - { AttributeName: gsi4pk, KeyType: HASH }
+            - { AttributeName: gsi4sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      StreamSpecification: { StreamViewType: NEW_AND_OLD_IMAGES }
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DeletionProtectionEnabled: true
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      # SSEType KMS + an explicit KMSMasterKeyId is what moves this table off
+      # alias/aws/dynamodb (which is what a bare SSEEnabled: true selects) and
+      # onto the customer-managed key. All three sub-properties are
+      # No-interruption updates, so this does NOT replace the table.
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DynamoDbKmsKeyArn
+      AttributeDefinitions: [ { AttributeName: eventId, AttributeType: S } ]
+      KeySchema: [ { AttributeName: eventId, KeyType: HASH } ]
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+Outputs:
+  TableName: { Value: !Ref Table }
+  TableArn: { Value: !GetAtt Table.Arn }
+  StreamArn: { Value: !GetAtt Table.StreamArn }
+  IdempotencyTableName: { Value: !Ref IdempotencyTable }

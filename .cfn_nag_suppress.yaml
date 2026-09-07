@@ -1,0 +1,190 @@
+# cfn_nag global deny list (rules never applied)
+# Usage: cfn_nag_scan --input-path infra --deny-list-path .cfn_nag_suppress.yaml
+# See: https://github.com/stelligent/cfn_nag#global-deny-list
+#
+# NOTE: the top-level key MUST be `RulesToSuppress`. cfn_nag raises a fatal
+# "Missing RulesToSuppress key in deny list" for any other key.
+#
+# SUPPRESSION RATIONALE (community portal — dev environment)
+# Findings marked "address" are tracked separately and NOT listed here.
+#
+# W89 is deliberately NOT listed here. Every AWS::Serverless::Function in
+# infra/ carries a per-resource `Metadata.cfn_nag.rules_to_suppress` entry for
+# it instead, so the rule stays live and will still catch any *new* function
+# that genuinely omits VpcConfig.
+
+---
+RulesToSuppress:
+
+  # ── W28: Named resources ──────────────────────────────────────────────────
+  # Explicit resource names are a deliberate architecture decision: they allow
+  # deterministic cross-stack references and service-mode JSON swaps without
+  # requiring CloudFormation exports. (Architecture decision D1.) Concretely, the
+  # nightly job runner invokes Lambdas BY NAME, env vars carry table names between
+  # stacks, and service-to-service calls resolve predictable names rather than
+  # CloudFormation exports. Removing the names is a large refactor with no security
+  # benefit — W28 is an operability warning, not a security one.
+  #
+  # SCOPE — RECOUNTED 2026-08-30, and the previous numbers here were WRONG.
+  # This block used to claim "exactly 57 resources: 37 alarms + 20 tables", and to
+  # state that SQS queues "are NOT evaluated by this rule at all — they are absent
+  # from RESOURCE_NAME_MAPPING". Both are false. AWS::SQS::Queue/QueueName IS in
+  # cfn_nag's ResourceWithExplicitNameRule mapping, and 8 named queues here match
+  # it. Measured against the mapping's 14 types, the real figures are:
+  #
+  #     55  AWS::CloudWatch::Alarm      (.AlarmName)
+  #     20  AWS::DynamoDB::Table        (.TableName)
+  #      8  AWS::SQS::Queue             (.QueueName)
+  #      1  AWS::SNS::Topic             (.TopicName)
+  #     --
+  #     84  total
+  #
+  # Named Lambda functions genuinely are absent from the mapping, so they do not
+  # trigger W28 despite being named throughout infra/. That part was correct.
+  #
+  # THE RISK W28 DESCRIBES IS NOW MITIGATED where it actually mattered. An
+  # explicitly-named resource cannot be replaced in place, so CloudFormation must
+  # delete the old one first. For the 20 tables that meant a replacing update,
+  # stack delete or rollback destroyed the data — ~380k items across the estate,
+  # ~190k in the largest table — while every -data template's Description already
+  # claimed "DeletionPolicy Retain". They are now genuinely Retain on both delete
+  # and replace, so a replacing update fails loudly ("table already exists") rather
+  # than silently losing rows. Alarms, queues and the topic carry no state, so
+  # replacement there is harmless.
+  #
+  # NOTE ON PORTABILITY: a centralised appsec scan does not read this file — you do
+  # not let the scanned repo switch the scanner off — so W28 still surfaces upstream
+  # and needs registering in the scanner's own exception process. Same applies to
+  # the bandit skips: see .bandit.
+  - id: W28
+    reason: "Explicit names are intentional (D1) - required for cross-stack references, name-based Lambda invocation and service-mode swaps. Affects 84 resources: 55 alarms + 20 tables + 8 queues + 1 topic. The tables now carry DeletionPolicy/UpdateReplacePolicy Retain so replacement cannot lose data."
+
+  # ── W89: Lambda not in VPC ────────────────────────────────────────────────
+  # Intentionally omitted — handled per-resource. See the note in the header.
+  # cfn_nag cannot evaluate this rule on SAM source: cfn-model's stand-in
+  # Serverless transform rebuilds each AWS::Serverless::Function with only
+  # Handler/Role/Runtime/ReservedConcurrentExecutions/Code, so VpcConfig is
+  # always nil and W89 fires on every function regardless of the template.
+  # Suppressing it globally here would also hide genuinely non-VPC functions.
+
+  # ── W92: ReservedConcurrentExecutions ────────────────────────────────────
+  # On-demand Lambda scaling is appropriate for a community portal. Reserved
+  # concurrency is a production-scale tradeoff deferred to the operations
+  # readiness review. (Architecture decision AC-3: no provisioned concurrency.)
+  - id: W92
+    reason: "Reserved concurrency deferred to production readiness review per AC-3"
+
+  # ── W84 REMOVED, 2026-08-31 ──────────────────────────────────────────────
+  # Suppressed on the grounds that "AWS-managed encryption is in place for all log
+  # groups" and a CMK was "an advanced compliance requirement not applicable to a
+  # community portal". The finding is now FIXED rather than suppressed: all 13 log
+  # groups set KmsKeyId against foundation.yaml's LogsKmsKey.
+  #
+  # The old rationale was also factually wrong, which is worth recording so it is
+  # not repeated. Omitting KmsKeyId does NOT select an AWS-managed KMS key — there
+  # is no alias/aws/logs. It means the data is not encrypted with KMS at all.
+  # CloudWatch Logs still encrypts server-side, but that is a different control
+  # from the one the suppression claimed was already satisfying the rule.
+  #
+  # Deleted rather than left in place: a suppression for a resolved finding
+  # silently pre-authorizes the next unencrypted log group somebody adds.
+  #
+  # The matching per-resource suppression on foundation.yaml's VpcFlowLogGroup is
+  # gone too — that was the only local W84 Metadata block in infra/.
+
+  # ── W32: CodeBuild EncryptionKey ─────────────────────────────────────────
+  # Default S3 encryption on CodeBuild artifacts is sufficient for a CI
+  # pipeline building open-source infrastructure templates. No sensitive build
+  # artifacts are produced that require CMK protection.
+  - id: W32
+    reason: "Default S3 encryption sufficient for open-source build artifacts"
+
+  # ── W78: DynamoDB PITR ───────────────────────────────────────────────────
+  # PITR is enabled on tables holding original non-reconstructable records.
+  # Derived cache tables (member-profiles, analytics, notifications, search)
+  # can be rebuilt from upstream sources and don't require PITR.
+  - id: W78
+    reason: "PITR enabled on critical tables; remaining tables are reconstructable caches"
+
+  # ── W48: SQS KmsMasterKeyId ──────────────────────────────────────────────
+  # W48 suppression REMOVED — REMEDIATED instead. All 8 queues now set
+  # KmsMasterKeyId to the customer managed SqsKmsKey (infra/keys.yaml), which is
+  # the one property W48 inspects, so the rule passes on its own terms.
+  #
+  # The old reason was wrong on its face: the queues did not fall back to
+  # "AWS-managed SSE", they explicitly set SqsManagedSseEnabled. W48 simply
+  # cannot see that property. Keeping a blanket entry here would now hide a real
+  # regression — if someone dropped KmsMasterKeyId from a queue, the queue would
+  # be unencrypted and this file would silence the finding.
+
+  # ── W47: SNS KmsMasterKeyId ──────────────────────────────────────────────
+  # SNS topic is used exclusively for ops alarms. No PII or sensitive data
+  # flows through it. AWS-managed encryption is sufficient.
+  - id: W47
+    reason: "AWS-managed SNS encryption sufficient; topic carries ops alarm metadata only"
+
+  # ── W77: Secrets Manager KmsKeyId ────────────────────────────────────────
+  # W77 suppression REMOVED — the resource no longer exists. All Secrets Manager
+  # use was deleted along with the bootstrap-admin secret: the seeder now
+  # generates the admin password, sets it PERMANENT and discards it, and the
+  # operator arrives via "Forgot password". There is no AWS::SecretsManager::Secret
+  # in any template for W77 to fire on. (Same removal as Checkov CKV_AWS_149.)
+
+  # ── W36/W40/W5: Security group egress rules ──────────────────────────────
+  # The security group still allows all outbound traffic, but the ORIGINAL
+  # REASONING IS NOW WRONG and is corrected here rather than left to mislead.
+  # It said restricting egress "would require VPC Interface Endpoints for each
+  # service (~$7/endpoint/month each)" — presented as the reason not to. Those
+  # endpoints were then added (2026-08-29) and the NAT Gateways and Internet
+  # Gateway deleted (2026-08-30), so the cost objection no longer applies.
+  #
+  # Why all-egress is still acceptable: with no internet path out of the VPC,
+  # "all outbound" now means "to the VPC endpoints and inside the VPC". A packet
+  # addressed anywhere else has no matching route and is dropped. The blast radius
+  # of the open egress rule is bounded by routing, not by the security group.
+  #
+  # Tightening it to per-endpoint prefix lists remains a genuine improvement and is
+  # deliberately NOT claimed as done. It would be defence in depth against a future
+  # change that reintroduces an egress path, not protection today.
+  - id: W36
+    reason: "All-egress required for Lambda VPC access to AWS service endpoints"
+  - id: W40
+    reason: "All-protocol egress required for Lambda-to-AWS-service communication in VPC"
+  - id: W5
+    reason: "All-egress required for Lambda VPC access to AWS service endpoints"
+
+  # ── W33 REMOVED, 2026-08-30 ──────────────────────────────────────────────
+  # Suppressed MapPublicIpOnLaunch on the grounds that "public subnets host NAT
+  # Gateways only". There are no public subnets and no NAT Gateways any more, so
+  # the rule has nothing to fire on. Deleted rather than left in place: a
+  # suppression for a resource that no longer exists silently pre-authorizes the
+  # next public subnet somebody adds.
+
+  # ── W19/W60 REMOVED, 2026-08-29 ───────────────────────────────────────────
+  # Flow logs used to be suppressed here as "deferred to production readiness
+  # review". They are now enabled on the VPC (foundation.yaml VpcFlowLog),
+  # because they are the evidence base for removing the NAT Gateways: proving
+  # nothing still egresses through NAT requires observing the traffic. The
+  # suppression is deleted rather than left in place so the scanner reports
+  # honestly if flow logs are ever switched off again.
+
+  # ── W35/W51: S3 access logging / bucket policy ───────────────────────────
+  # SPA bucket is served via CloudFront with OAI. User access is logged at
+  # CloudFront level. Direct S3 access is blocked. Bucket policy is managed
+  # by CloudFront's OAI grant.
+  - id: W35
+    reason: "S3 access logging redundant — all user traffic goes through CloudFront (logged there)"
+  - id: W51
+    reason: "Bucket policy is set by CloudFront OAI — no additional bucket policy needed"
+
+  # ── W70/W10: CloudFront TLS / access logging ─────────────────────────────
+  # CloudFront uses TLS 1.2 minimum by default with the default certificate.
+  # Access logging adds S3 cost; CloudWatch provides sufficient metrics.
+  - id: W70
+    reason: "Default CloudFront certificate enforces TLS 1.2 minimum"
+  - id: W10
+    reason: "CloudFront access logging deferred; CloudWatch metrics provide sufficient visibility"
+
+  # ── W23: Security group missing description ───────────────────────────────
+  - id: W23
+    reason: "Minor lint — security group purpose is documented in the template description"

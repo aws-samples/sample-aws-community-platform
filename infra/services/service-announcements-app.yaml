@@ -1,0 +1,298 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: App stack for announcements (REAL Lambda + routes + scoped role + event consumer + DLQ + alarms).
+Parameters:
+  Stage: { Type: String, Default: dev }
+  RestApiId: { Type: String }
+  # The private twin of RestApiId. Same route table, reachable only from
+  # inside the VPC through the execute-api interface endpoint.
+  PrivateRestApiId: { Type: String }
+  RootResourceId: { Type: String }
+  EventBusName: { Type: String }
+  EventBusArn: { Type: String, Default: '' }
+  TableName: { Type: String }
+  TableArn: { Type: String }
+  IdempotencyTableName: { Type: String }
+  ApiBaseUrl: { Type: String, Default: '', Description: "Shared API Gateway invoke URL, used by DirectoryClient for same-account author/group name reads (Members/Groups)." }
+  OpsAlarmTopicArn: { Type: String }
+  PrivateSubnetIds: { Type: CommaDelimitedList }
+  LambdaSecurityGroupId: { Type: String }
+  # CMK from the foundation stack for the log group(s) below. Required (no
+  # Default): an empty string is not a valid KmsKeyId, so a missing value must
+  # fail at deploy time rather than silently produce an unencrypted log group.
+  LogsKmsKeyArn: { Type: String }
+  # Managed policy from foundation granting DynamoDB-mediated use of the table
+  # CMK. Required (no Default): without it every DynamoDB call from these
+  # functions fails with a KMS AccessDenied once the key policy's wildcard
+  # statement is removed.
+  DynamoDbKmsAccessPolicyArn: { Type: String }
+  # SQS CMK + its use policy from the Keys stack. Required (no Default):
+  # an empty KmsMasterKeyId is not valid, and a queue silently falling back
+  # to no encryption is exactly what this change exists to prevent.
+  SqsKmsKeyArn: { Type: String }
+  SqsKmsAccessPolicyArn: { Type: String }
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 15
+    Tracing: Active
+Resources:
+  # Dead-letter queue for the event consumer (RESILIENCY-10): a permanently
+  # failing EventCreated/GroupSoftDeleted/GroupRestored lands here rather than
+  # being lost; the DLQ-depth alarm below signals it.
+  # SSE-KMS with the shared SQS CMK (Keys stack). Swapped from SqsManagedSseEnabled,
+  # which is mutually exclusive with KmsMasterKeyId: both Checkov CKV_AWS_27 and
+  # cfn_nag W48 inspect only KmsMasterKeyId, so SSE-SQS could never satisfy them.
+  # A customer key rather than alias/aws/sqs because EVENTBRIDGE writes this queue
+  # (it is the DeadLetterConfig on the rule below) and must be granted in the key
+  # policy — impossible on an AWS-managed key. See infra/keys.yaml SqsKmsKey.
+  ConsumerDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600   # 14 days
+      KmsMasterKeyId: !Ref SqsKmsKeyArn
+      KmsDataKeyReusePeriodSeconds: 86400
+  Fn:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "announcements-${Stage}"
+      Handler: app.handler            # REAL handler (replaces mock_handler.handler)
+      # Pure-Python package (body stored as inert Markdown; no native sanitizer).
+      CodeUri: ../../dist/announcements.zip
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTableName
+          EVENT_BUS_NAME: !Ref EventBusName
+          API_BASE_URL: !Ref ApiBaseUrl
+          ACTIVE_SET_CACHE_TTL_SECONDS: '30'
+          DIRECTORY_TIMEOUT_MS: '1500'
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - !Ref SqsKmsAccessPolicyArn
+        # Least privilege (SECURITY-06) — explicit scoped statements, no wildcards.
+        - Statement:
+            - Sid: TableCrud
+              Effect: Allow
+              Action: [ dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan ]
+              Resource: !Ref TableArn
+        - DynamoDBCrudPolicy: { TableName: !Ref IdempotencyTableName }
+        - Statement:
+            - Sid: PublishDomainEvents
+              Effect: Allow
+              Action: events:PutEvents
+              Resource: !If [ HasBusArn, !Ref EventBusArn, !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EventBusName}" ]
+            # Read-only name denormalization (NFR-AN-REL-1) — forwards the caller's
+            # own JWT; no service-to-service credential minted.
+            - Sid: DirectoryInvoke
+              Effect: Allow
+              Action: execute-api:Invoke
+              Resource:
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/GET/members/*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/GET/members/*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/GET/groups/*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/GET/groups/*"
+        - Statement:
+            - Sid: ConsumerDlqSend
+              Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt ConsumerDlq.Arn
+  # Event consumption (D-INFRA-3): EventCreated (only when announce=true, so a
+  # non-announcing event never wakes this Lambda) + GroupSoftDeleted/GroupRestored.
+  ConsumerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "announcements-consumer-${Stage}"
+      EventBusName: !Ref EventBusName
+      EventPattern:
+        source: [ events, identity-access ]
+        detail-type: [ EventCreated, GroupSoftDeleted, GroupRestored ]
+      State: ENABLED
+      Targets:
+        - Id: announcements-event-consumer
+          Arn: !GetAtt Fn.Arn
+          DeadLetterConfig: { Arn: !GetAtt ConsumerDlq.Arn }
+          RetryPolicy: { MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 3600 }
+  ConsumerRuleInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ConsumerRule.Arn
+  ConsumerDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [ !Ref ConsumerDlq ]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt ConsumerDlq.Arn
+            Condition: { ArnEquals: { "aws:SourceArn": !GetAtt ConsumerRule.Arn } }
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [ { Name: FunctionName, Value: !Ref Fn } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  ThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [ { Name: FunctionName, Value: !Ref Fn } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  # A message in the DLQ means an event consumer permanently failed (NFR-AN-SEC-9).
+  # ── Fan-out degradation signal ────────────────────────────────────────────
+  # directory_client fails CLOSED: on timeout it logs a warning, returns None,
+  # and the caller substitutes the raw member id. The request still returns 200,
+  # so a user sees a UUID where an author name belongs and NOTHING reports an
+  # error. Until now announcements had no metric or alarm for that at all, so the
+  # degradation was completely invisible — member-profiles has had this signal
+  # since it was built (FanOutFailures), announcements never did.
+  #
+  # Added while migrating this service's fan-out to the private API. A measured
+  # probe from inside the VPC showed the two API paths are equivalent when warm
+  # (275ms private vs 278ms public median), but that a COLD target takes ~2.5s
+  # against directory_client's 1500ms budget — on either path. So this fires on
+  # cold starts, which is the point: the timeout is real and pre-existing, and the
+  # fix is to see it rather than to widen the budget until it disappears.
+  #
+  # Explicit log group for the same reason member-profiles has one: Lambda only
+  # auto-creates it on first invocation, so the metric filter below cannot attach
+  # on a fresh install without it.
+  FnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/announcements-${Stage}"
+      RetentionInDays: 30
+      KmsKeyId: !Ref LogsKmsKeyArn
+  DirectoryLookupFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # Matches directory_client's exact message. NOTE it is NOT the same string
+      # member-profiles uses ("fan-out call failed") — the two services word it
+      # differently, which already caused a verification to look for the wrong
+      # text and miss real timeouts.
+      FilterPattern: '{ $.message = "directory lookup failed*" }'
+      MetricTransformations:
+        - MetricNamespace: Portal/Announcements
+          MetricName: DirectoryLookupFailures
+          MetricValue: '1'
+  DirectoryLookupFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: Portal/Announcements
+      MetricName: DirectoryLookupFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: no data means no fan-out calls were made, not that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA on an idle
+      # environment and gets ignored.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+  ConsumerDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [ { Name: QueueName, Value: !GetAtt ConsumerDlq.QueueName } ]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/*"
+  # Second permission, for the PRIVATE API. SourceArn pins a permission to a
+  # single api id, so the public one above does NOT cover requests arriving
+  # through the private API — without this they fail with API Gateway unable to
+  # invoke the function.
+  PrivateApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/*"
+
+  # ── Silent-degradation signals ────────────────────────────────────────────
+  # Every fail-soft path below logs a warning, substitutes a fallback and returns
+  # success, so without these the degradation is invisible: the caller gets a 200
+  # containing quietly wrong data. Added after finding 49 unnoticed membership-
+  # lookup timeouts in forums over four days.
+  #
+  # PLAIN-TEXT filter patterns on purpose. get_logger() attaches the JSON
+  # formatter only to the logger it names (propagate=False), so modules using
+  # logging.getLogger(__name__) emit Lambda's default TEXT format. A JSON
+  # { $.message = ... } pattern matches nothing there; a quoted substring matches
+  # both formats.
+  LostDomainEventsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # a domain event was dropped after its write committed, so downstream projections diverge
+      FilterPattern: '?"event publish failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/Announcements
+          MetricName: LostDomainEvents
+          MetricValue: '1'
+  LostDomainEventsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "a domain event was dropped after its write committed, so downstream projections diverge"
+      Namespace: Portal/Announcements
+      MetricName: LostDomainEvents
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: absent data means no calls were attempted, NOT that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA when idle.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+Conditions:
+  HasBusArn: !Not [ !Equals [ !Ref EventBusArn, '' ] ]
+Outputs:
+  FunctionArn: { Value: !GetAtt Fn.Arn }
+  ConsumerDlqArn: { Value: !GetAtt ConsumerDlq.Arn }

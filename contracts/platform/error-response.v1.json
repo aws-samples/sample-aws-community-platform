@@ -1,0 +1,24 @@
+{
+  "title": "ErrorResponse",
+  "description": "Standard error shape returned by mocks and required of real services. Generic, user-safe messages only (SECURITY-15).",
+  "type": "object",
+  "required": ["code", "message"],
+  "additionalProperties": false,
+  "properties": {
+    "code": { "type": "string", "description": "Stable machine code, e.g. FORBIDDEN, NOT_IMPLEMENTED, VALIDATION_ERROR." },
+    "message": { "type": "string", "description": "Generic, user-safe message (no internals/stack traces)." },
+    "correlationId": { "type": "string", "description": "For support/log correlation." },
+    "details": {
+      "type": "array",
+      "description": "Optional field-level validation messages (safe subset).",
+      "items": {
+        "type": "object",
+        "required": ["field", "message"],
+        "properties": {
+          "field": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      }
+    }
+  }
+}

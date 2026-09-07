@@ -1,0 +1,551 @@
+openapi: 3.0.3
+info:
+  title: Forums API
+  version: 2.0.0
+  description: >
+    Threaded group-scoped discussions. Forums → Channels → Posts → Replies with
+    reactions, @mentions, pinning, accepted answers, following, reporting + moderation,
+    and keyword search. Administrator excluded (BR-1). All routes under /forums {proxy+}.
+paths:
+  /forums:
+    get:
+      operationId: browseForums
+      summary: Browse accessible forums (W1, US-4.12)
+      responses:
+        '200': { description: Forums grouped by group, content: { application/json: { schema: { $ref: '#/components/schemas/ForumList' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      operationId: createForum
+      summary: Create a forum in a group (BR-6)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, groupId]
+              properties:
+                name: { type: string, maxLength: 100 }
+                groupId: { type: string }
+                description: { type: string, maxLength: 500 }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Forum' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /forums/{id}:
+    put:
+      operationId: editForum
+      summary: Edit forum name/description (BR-8)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, maxLength: 100 }
+                description: { type: string, maxLength: 500 }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Forum' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      operationId: deleteForum
+      summary: Delete forum + cascade (BR-11)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /forums/{id}/channels:
+    post:
+      operationId: createChannel
+      summary: Create a channel in a forum (BR-7)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 100 }
+                description: { type: string, maxLength: 500 }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Channel' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /channels/{id}:
+    put:
+      operationId: editChannel
+      summary: Edit channel name/description (BR-8)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, maxLength: 100 }
+                description: { type: string, maxLength: 500 }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Channel' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      operationId: deleteChannel
+      summary: Delete channel + cascade (BR-11)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /channels/{id}/posts:
+    get:
+      operationId: listPosts
+      summary: List posts in a channel (W2, US-4.18)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: sort, in: query, schema: { type: string, enum: [newest, active, reactions, unanswered], default: newest } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200': { description: Posts, content: { application/json: { schema: { $ref: '#/components/schemas/PostList' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      operationId: createPost
+      summary: Create a post in a channel (W4, US-4.5)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, body]
+              properties:
+                title: { type: string, maxLength: 200 }
+                body: { type: string, maxLength: 10000, description: Markdown }
+                tags: { type: array, items: { type: string, maxLength: 30 }, maxItems: 5 }
+                mentions: { type: array, items: { type: string }, maxItems: 25, description: User IDs to @mention }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Post' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /posts/{id}:
+    get:
+      operationId: getThread
+      summary: Get post + replies (W3)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200': { description: Thread, content: { application/json: { schema: { $ref: '#/components/schemas/Thread' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: editPost
+      summary: Edit own post (BR-5/13)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string, maxLength: 200 }
+                body: { type: string, maxLength: 10000 }
+                tags: { type: array, items: { type: string, maxLength: 30 }, maxItems: 5 }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Post' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      operationId: deletePost
+      summary: Delete post + cascade (BR-5/11)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /posts/{id}/replies:
+    get:
+      operationId: listReplies
+      summary: List replies for a post
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200': { description: Replies, content: { application/json: { schema: { $ref: '#/components/schemas/ReplyList' } } } }
+    post:
+      operationId: createReply
+      summary: Reply to a post (W5, US-4.6)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string, maxLength: 10000, description: Markdown }
+                mentions: { type: array, items: { type: string }, maxItems: 25 }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Reply' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /replies/{id}:
+    put:
+      operationId: editReply
+      summary: Edit own reply (BR-5/13)
+      description: >-
+        postId is REQUIRED. Replies are stored under their parent post, so a reply id
+        alone does not address the item. It is taken from the caller because every
+        serialized reply already carries postId; the reply is then read under that
+        post, so a mismatched postId returns 404 rather than reaching anything.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: postId, in: query, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                body: { type: string, maxLength: 10000 }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Reply' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      operationId: deleteReply
+      summary: Delete reply (BR-5 — author, or CL/UGL in scope)
+      description: >-
+        postId is REQUIRED, for the same reason as editReply. Soft delete: the reply
+        leaves the thread index, the post's replyCount is decremented, and if it was
+        the accepted answer the post's acceptedReplyId is cleared — all in one
+        transaction.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: postId, in: query, required: true, schema: { type: string } }
+      responses:
+        '204': { description: Deleted }
+        '400': { description: postId missing }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: No such reply under that post }
+  /posts/{id}/reactions:
+    post:
+      operationId: toggleReaction
+      summary: Set/replace/clear reaction (W7, BR-16, DV-5)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                kind: { type: string, enum: [upvote, like, heart, celebrate, insightful, clear], description: "'clear' removes the reaction" }
+      responses:
+        '200': { description: Toggled }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /replies/{id}/reactions:
+    post:
+      operationId: toggleReplyReaction
+      summary: Set/replace/clear reaction on a reply
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                kind: { type: string, enum: [upvote, like, heart, celebrate, insightful, clear] }
+      responses:
+        '200': { description: Toggled }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /posts/{id}/pin:
+    post:
+      operationId: togglePin
+      summary: Pin/unpin a post (W9, BR-14)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Toggled }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /posts/{id}/accept:
+    post:
+      operationId: acceptAnswer
+      summary: Set/clear accepted reply (W9, BR-15)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                replyId: { type: string, nullable: true, description: "null to clear" }
+      responses:
+        '200': { description: Accepted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /posts/{id}/follow:
+    post:
+      operationId: toggleFollowPost
+      summary: Follow/unfollow a post (W10, BR-18)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Toggled }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /channels/{id}/follow:
+    post:
+      operationId: toggleFollowChannel
+      summary: Follow/unfollow a channel (W10, BR-18)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Toggled }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /forums/follows:
+    get:
+      operationId: listFollows
+      summary: List caller's follows (W10)
+      responses:
+        '200': { description: Follows, content: { application/json: { schema: { $ref: '#/components/schemas/FollowList' } } } }
+  /posts/{id}/report:
+    post:
+      operationId: reportPost
+      summary: Report a post (W11, US-4.17)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '200': { description: Reported }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: Already reported by this user }
+  /replies/{id}/report:
+    post:
+      operationId: reportReply
+      summary: Report a reply
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '200': { description: Reported }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: Already reported }
+  /forums/moderation:
+    get:
+      operationId: moderationQueue
+      summary: List open reports (W11, US-4.17)
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200': { description: Reports, content: { application/json: { schema: { $ref: '#/components/schemas/ReportList' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /forums/moderation/{id}/dismiss:
+    post:
+      operationId: dismissReport
+      summary: Dismiss a report (W11)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Dismissed }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /forums/moderation/{id}/action:
+    post:
+      operationId: actionReport
+      summary: Delete reported content (W11)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Actioned — content deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /forums/mention-suggest:
+    get:
+      operationId: mentionSuggest
+      summary: Autocomplete @mention candidates (W8, BR-21)
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - { name: groupId, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Candidates, content: { application/json: { schema: { $ref: '#/components/schemas/MentionCandidates' } } } }
+  /forums/search:
+    get:
+      operationId: searchForum
+      summary: Keyword search (W12, BR-29, DV-2)
+      x-semantic-search: true
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - { name: groupId, in: query, schema: { type: string } }
+        - { name: forumId, in: query, schema: { type: string } }
+        - { name: channelId, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+      responses:
+        '200': { description: Hits, content: { application/json: { schema: { $ref: '#/components/schemas/SearchResults' } } } }
+components:
+  responses:
+    NotFound: { description: Not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Forbidden: { description: Forbidden, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    RateLimited: { description: Rate limited, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  schemas:
+    Forum:
+      type: object
+      required: [id, name, groupId]
+      properties:
+        id: { type: string }
+        groupId: { type: string }
+        name: { type: string }
+        description: { type: string }
+        channelCount: { type: integer }
+        createdAt: { type: string, format: date-time }
+        channels: { type: array, items: { $ref: '#/components/schemas/Channel' } }
+    ForumList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Forum' } }
+        count: { type: integer }
+    Channel:
+      type: object
+      required: [id, name, forumId]
+      properties:
+        id: { type: string }
+        forumId: { type: string }
+        groupId: { type: string }
+        name: { type: string }
+        description: { type: string }
+        postCount: { type: integer }
+        lastActivityAt: { type: string, format: date-time }
+    Post:
+      type: object
+      required: [id, title, channelId, authorId]
+      properties:
+        id: { type: string }
+        channelId: { type: string }
+        forumId: { type: string }
+        groupId: { type: string }
+        authorId: { type: string }
+        authorName: { type: string }
+        authorRoleLabel: { type: string }
+        title: { type: string }
+        body: { type: string }
+        tags: { type: array, items: { type: string } }
+        pinned: { type: boolean }
+        pinnedAt: { type: string, format: date-time }
+        acceptedReplyId: { type: string, nullable: true }
+        edited: { type: boolean }
+        editedAt: { type: string, format: date-time }
+        replyCount: { type: integer }
+        reactionCounts: { type: object, additionalProperties: { type: integer } }
+        callerReaction: { type: string, nullable: true, description: "Caller's current reaction kind, if any" }
+        canAccept: { type: boolean, description: "Caller may accept/unaccept a reply (author or leader)" }
+        canReact: { type: boolean, description: "Caller may react — false on the caller's own post (no self-reaction)" }
+        canEdit: { type: boolean, description: "Caller may edit (BR-5: author ONLY — leaders may not edit others' content)" }
+        canDelete: { type: boolean, description: "Caller may delete (BR-5: author, or CL any group, or UGL own group)" }
+        createdAt: { type: string, format: date-time }
+    PostList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Post' } }
+        count: { type: integer }
+        cursor: { type: string, nullable: true }
+    Thread:
+      type: object
+      required: [post, replies]
+      properties:
+        post: { $ref: '#/components/schemas/Post' }
+        replies: { $ref: '#/components/schemas/ReplyList' }
+    Reply:
+      type: object
+      required: [id, body, postId, authorId]
+      properties:
+        id: { type: string }
+        postId: { type: string }
+        groupId: { type: string }
+        authorId: { type: string }
+        authorName: { type: string }
+        authorRoleLabel: { type: string }
+        body: { type: string }
+        accepted: { type: boolean }
+        edited: { type: boolean }
+        editedAt: { type: string, format: date-time }
+        canEdit: { type: boolean, description: "Caller may edit (BR-5: author ONLY — leaders may not edit others' content)" }
+        canDelete: { type: boolean, description: "Caller may delete (BR-5: author, or CL any group, or UGL own group)" }
+        reactionCounts: { type: object, additionalProperties: { type: integer } }
+        callerReaction: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+    ReplyList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Reply' } }
+        count: { type: integer }
+        cursor: { type: string, nullable: true }
+    Report:
+      type: object
+      required: [id, targetId, targetType, status]
+      properties:
+        id: { type: string }
+        targetId: { type: string }
+        targetType: { type: string, enum: [post, reply] }
+        groupId: { type: string }
+        reporterId: { type: string }
+        reason: { type: string }
+        status: { type: string, enum: [Open, Dismissed, Actioned] }
+        createdAt: { type: string, format: date-time }
+        resolvedAt: { type: string, format: date-time }
+        resolvedBy: { type: string }
+    ReportList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Report' } }
+        count: { type: integer }
+        cursor: { type: string, nullable: true }
+    Follow:
+      type: object
+      required: [targetId, targetType]
+      properties:
+        targetId: { type: string }
+        targetType: { type: string, enum: [channel, post] }
+        targetName: { type: string }
+        createdAt: { type: string, format: date-time }
+    FollowList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Follow' } }
+        count: { type: integer }
+    MentionCandidates:
+      type: object
+      properties:
+        items: { type: array, items: { type: object, properties: { userId: { type: string }, displayName: { type: string }, role: { type: string } } } }
+        count: { type: integer }
+    SearchResults:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Post' } }
+        count: { type: integer, description: Number of hits on this page. }
+        total: { type: integer, description: Total visible hits for the query after access and scope filtering, so a client can show "showing N of M". }
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        details: { type: array, items: { type: string } }
+        correlationId: { type: string }

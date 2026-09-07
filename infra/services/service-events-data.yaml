@@ -1,0 +1,227 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Data stack for events (tables + streams + idempotency). DeletionPolicy Retain.
+  Three GSIs on the events table (GSI3 removed — Content Library rework 2026-08-18).
+  GSI4 is now UNUSED (the reminder feature was removed 2026-08-27) and is kept
+  only so the drop can be staged separately. New library-${Stage} table with 3
+  GSIs for the standalone Content Library (US-2.20 rework).
+Parameters:
+  Stage: { Type: String, Default: dev }
+  # CMK from the foundation stack. Required (no Default): an empty string is
+  # not a valid KMSMasterKeyId, so a missing value must fail at deploy time
+  # rather than silently fall back to the AWS managed key.
+  DynamoDbKmsKeyArn: { Type: String }
+# DeletionPolicy / UpdateReplacePolicy are Retain on every table below.
+#
+# They were BOTH `Delete` until 2026-08-30, while this template's own Description
+# said "DeletionPolicy Retain" -- documented one way, configured the other.
+#
+# Why it matters here specifically: these tables are explicitly named (architecture
+# decision D1), which is exactly what cfn_nag W28 warns about. An explicitly-named
+# resource cannot be replaced in place, so CloudFormation has to DELETE the old one
+# first. With Delete that made any replacing update, stack delete or rollback a
+# data-loss event -- across the estate roughly 380k items, the largest single table
+# holding ~190k. PITR is enabled so it was recoverable, but restoring a table plus
+# its GSIs is an incident, not a no-op.
+#
+# Deliberate consequence: Retain plus an explicit name means a replacing update now
+# FAILS with "table already exists" rather than silently destroying rows. That is a
+# hard stop requiring manual intervention, and it is the correct trade.
+# DeletionProtectionEnabled complements the Retain policies above; it does not
+# duplicate them. Retain is a promise CloudFormation makes to ITSELF -- it stops the
+# stack deleting or replacing a table. It does nothing about a plain
+# `aws dynamodb delete-table`, where the rows go regardless. Deletion protection is
+# enforced by the DynamoDB service, so the table cannot be deleted by anyone,
+# irrespective of IAM.
+#
+# It protects the TABLE, not the data: PutItem/UpdateItem/DeleteItem and TTL expiry
+# all still work. This is an anti-accident control, not data integrity.
+#
+# Teardown cost, since these are dev stacks: the tables already survive a stack
+# delete because of Retain, so they were always going to be removed by hand. This
+# adds one unlock step before that --
+#   aws dynamodb update-table --table-name <n> --no-deletion-protection-enabled
+# -- or flip this to false here and deploy, which is an in-place Modify with no
+# replacement. Set through CloudFormation rather than the CLI so a fresh account gets
+# it too; the VPC default-security-group lockdown noted in foundation.yaml is the
+# cautionary example of a hand-applied hardening that does not reproduce.
+#
+# Also satisfies Security Hub DynamoDB.6 and the AWS Config managed rule
+# dynamodb-table-deletion-protection-enabled.
+Resources:
+  Table:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # No explicit TableName (cfn_nag W28). CloudFormation generates the name
+      # and the stack Output below passes it on, so nothing needs to know it at
+      # author time. Retain policies are kept, so a future replacing update
+      # ORPHANS this table rather than deleting it -- new table comes up EMPTY.
+      DeletionProtectionEnabled: true
+      BillingMode: PAY_PER_REQUEST
+      # PITR is mandatory rather than merely prudent here: unlike Member Profiles
+      # (a derived cache) and Settings (small and re-enterable), this table holds
+      # ORIGINAL records — events, RSVPs, attendance — with no upstream source of
+      # truth to rebuild from (NFR-EV-AVAIL-3).
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      # SSEType KMS + an explicit KMSMasterKeyId is what moves this table off
+      # alias/aws/dynamodb (which is what a bare SSEEnabled: true selects) and
+      # onto the customer-managed key. All three sub-properties are
+      # No-interruption updates, so this does NOT replace the table.
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DynamoDbKmsKeyArn
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: gsi1pk, AttributeType: S }
+        - { AttributeName: gsi1sk, AttributeType: S }
+        - { AttributeName: gsi2pk, AttributeType: S }
+        - { AttributeName: gsi2sk, AttributeType: S }
+        - { AttributeName: gsi4pk, AttributeType: S }
+        - { AttributeName: gsi4sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        # GSI1 - listings + calendar. SCOPE#<groupId|COMMUNITY>#<status> / startsAt.
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: gsi1pk, KeyType: HASH }
+            - { AttributeName: gsi1sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        # GSI2 - a member's own RSVPs. USER#<userId> / RSVP#<startsAt>#<eventId>.
+        - IndexName: GSI2
+          KeySchema:
+            - { AttributeName: gsi2pk, KeyType: HASH }
+            - { AttributeName: gsi2sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        # GSI4 - UNUSED since the reminder feature was removed (2026-08-27). No
+        # code reads or writes gsi4pk/gsi4sk any more, so it is empty and costs
+        # nothing. Kept here deliberately: dropping an index is irreversible, and
+        # this repo stages index changes one at a time (see stage_events_gsis.py,
+        # the GSI3 precedent). Remove in a follow-up change of its own.
+        - IndexName: GSI4
+          KeySchema:
+            - { AttributeName: gsi4pk, KeyType: HASH }
+            - { AttributeName: gsi4sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      StreamSpecification: { StreamViewType: NEW_AND_OLD_IMAGES }
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DeletionProtectionEnabled: true
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      # SSEType KMS + an explicit KMSMasterKeyId is what moves this table off
+      # alias/aws/dynamodb (which is what a bare SSEEnabled: true selects) and
+      # onto the customer-managed key. All three sub-properties are
+      # No-interruption updates, so this does NOT replace the table.
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DynamoDbKmsKeyArn
+      AttributeDefinitions: [ { AttributeName: eventId, AttributeType: S } ]
+      KeySchema: [ { AttributeName: eventId, KeyType: HASH } ]
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+
+  # Event Ideas table (US-14). Separate from the events table (all 4 GSI slots
+  # are occupied there). One GSI: GROUP#<groupId> / descending vote sort key.
+  IdeasTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DeletionProtectionEnabled: true
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      # SSEType KMS + an explicit KMSMasterKeyId is what moves this table off
+      # alias/aws/dynamodb (which is what a bare SSEEnabled: true selects) and
+      # onto the customer-managed key. All three sub-properties are
+      # No-interruption updates, so this does NOT replace the table.
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DynamoDbKmsKeyArn
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: gsi1pk, AttributeType: S }
+        - { AttributeName: gsi1sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: gsi1pk, KeyType: HASH }
+            - { AttributeName: gsi1sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  # Content Library table (US-2.20 rework). Standalone table — events table
+  # had all 4 GSI slots occupied. Three GSIs:
+  #   GSI1 COMMUNITY/<addedAt>#<id> — newest-first search (SPARSE: Clean only)
+  #   GSI2 MAT#<materialId>/<id>    — auto-removal lookup (SPARSE: Path 1)
+  #   GSI3 CON#<contributionId>/<id> — idempotency (SPARSE: Path 2)
+  LibraryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DeletionProtectionEnabled: true
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      # SSEType KMS + an explicit KMSMasterKeyId is what moves this table off
+      # alias/aws/dynamodb (which is what a bare SSEEnabled: true selects) and
+      # onto the customer-managed key. All three sub-properties are
+      # No-interruption updates, so this does NOT replace the table.
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DynamoDbKmsKeyArn
+      AttributeDefinitions:
+        - { AttributeName: pk,     AttributeType: S }
+        - { AttributeName: sk,     AttributeType: S }
+        - { AttributeName: gsi1pk, AttributeType: S }
+        - { AttributeName: gsi1sk, AttributeType: S }
+        - { AttributeName: gsi2pk, AttributeType: S }
+        - { AttributeName: gsi2sk, AttributeType: S }
+        - { AttributeName: gsi3pk, AttributeType: S }
+        - { AttributeName: gsi3sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        # GSI1 - newest-first search. SPARSE: only Clean resources carry the key.
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: gsi1pk, KeyType: HASH }
+            - { AttributeName: gsi1sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        # GSI2 - materialId → resourceId for auto-removal (BR-LIB-P5).
+        - IndexName: GSI2
+          KeySchema:
+            - { AttributeName: gsi2pk, KeyType: HASH }
+            - { AttributeName: gsi2sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        # GSI3 - contributionId → resourceId for Path 2 idempotency (BR-LIB-P12).
+        - IndexName: GSI3
+          KeySchema:
+            - { AttributeName: gsi3pk, KeyType: HASH }
+            - { AttributeName: gsi3sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+Outputs:
+  TableName: { Value: !Ref Table }
+  TableArn: { Value: !GetAtt Table.Arn }
+  StreamArn: { Value: !GetAtt Table.StreamArn }
+  IdempotencyTableName: { Value: !Ref IdempotencyTable }
+  IdeasTableName: { Value: !Ref IdeasTable }
+  IdeasTableArn: { Value: !GetAtt IdeasTable.Arn }
+  LibraryTableName: { Value: !Ref LibraryTable }
+  LibraryTableArn: { Value: !GetAtt LibraryTable.Arn }

@@ -1,0 +1,477 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  App stack for events (REAL Lambda + routes + role + rules + alarms).
+  One function serves four inputs (Unit 4 NFR Design J4): authenticated HTTP,
+  the unauthenticated /event-uploads mint, GroupSoftDeleted, and S3/GuardDuty
+  object events.
+Parameters:
+  Stage: { Type: String, Default: dev }
+  RestApiId: { Type: String }
+  # The private twin of RestApiId. Same route table, reachable only from
+  # inside the VPC through the execute-api interface endpoint.
+  PrivateRestApiId: { Type: String }
+  RootResourceId: { Type: String }
+  EventBusName: { Type: String }
+  EventBusArn: { Type: String, Default: '' }
+  TableName: { Type: String }
+  TableArn: { Type: String, Default: '' }
+  IdempotencyTableName: { Type: String }
+  IdeasTableName: { Type: String, Default: '' }
+  IdeasTableArn: { Type: String, Default: '' }
+  FileShareBucketName: { Type: String, Default: '' }
+  FileShareBucketArn: { Type: String, Default: '' }
+  LibraryTableName: { Type: String, Default: '' }
+  LibraryTableArn: { Type: String, Default: '' }
+  ApiBaseUrl: { Type: String, Default: '' }
+  PublicUploadBaseUrl: { Type: String, Default: '' }
+  EnableSemanticSearch: { Type: String, Default: 'false' }
+  OpsAlarmTopicArn: { Type: String }
+  PrivateSubnetIds: { Type: CommaDelimitedList }
+  LambdaSecurityGroupId: { Type: String }
+  # CMK from the foundation stack for the log group(s) below. Required (no
+  # Default): an empty string is not a valid KmsKeyId, so a missing value must
+  # fail at deploy time rather than silently produce an unencrypted log group.
+  LogsKmsKeyArn: { Type: String }
+  # Managed policy from foundation granting DynamoDB-mediated use of the table
+  # CMK. Required (no Default): without it every DynamoDB call from these
+  # functions fails with a KMS AccessDenied once the key policy's wildcard
+  # statement is removed.
+  DynamoDbKmsAccessPolicyArn: { Type: String }
+
+Globals:
+  Function:
+    Runtime: python3.12
+    # Raised from 256/15: a 104-occurrence series create and a 1000-row
+    # attendance apply both do many small writes in one invocation.
+    MemorySize: 512
+    Timeout: 60
+    Tracing: Active
+Conditions:
+  HasBusArn: !Not [ !Equals [ !Ref EventBusArn, '' ] ]
+  # Keyed on the Arn (not the Name) so cfn-lint's condition-aware resolution can
+  # prove the Ref/Sub below never sees the empty default.
+  HasBucket: !Not [ !Equals [ !Ref FileShareBucketArn, '' ] ]
+  HasTableArn: !Not [ !Equals [ !Ref TableArn, '' ] ]
+  HasIdeasTable: !Not [ !Equals [ !Ref IdeasTableArn, '' ] ]
+  HasLibraryTable: !Not [ !Equals [ !Ref LibraryTableArn, '' ] ]
+Resources:
+  Fn:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "events-${Stage}"
+      Handler: app.handler            # REAL handler (replaces mock_handler.handler)
+      CodeUri: ../../dist/events.zip
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTableName
+          EVENT_BUS_NAME: !Ref EventBusName
+          FILE_SHARE_BUCKET: !Ref FileShareBucketName
+          API_BASE_URL: !Ref ApiBaseUrl
+          PUBLIC_UPLOAD_BASE_URL: !Ref PublicUploadBaseUrl
+          ENABLE_SEMANTIC_SEARCH: !Ref EnableSemanticSearch
+          IDEAS_TABLE_NAME: !Ref IdeasTableName
+          LIBRARY_TABLE_NAME: !Ref LibraryTableName
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - Statement:
+            - Sid: OwnTables
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !If [ HasTableArn, !Ref TableArn, !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}" ]
+                - !If [ HasTableArn, !Sub "${TableArn}/index/*", !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/*" ]
+        # Library table permissions (Content Library rework, US-2.20)
+        - !If
+          - HasLibraryTable
+          - Statement:
+              - Sid: LibraryTableCrud
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                Resource:
+                  - !Ref LibraryTableArn
+                  - !Sub "${LibraryTableArn}/index/*"
+          - !Ref AWS::NoValue
+        # Ideas table permissions (Event Ideas feature, US-14)
+        - !If
+          - HasIdeasTable
+          - Statement:
+              - Sid: IdeasTableCrud
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Ref IdeasTableArn
+                  - !Sub "${IdeasTableArn}/index/*"
+          - !Ref AWS::NoValue
+        - DynamoDBCrudPolicy: { TableName: !Ref IdempotencyTableName }
+        - Statement:
+            - Sid: PublishDomainEvents
+              Effect: Allow
+              Action: events:PutEvents
+              Resource: !If [ HasBusArn, !Ref EventBusArn, !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EventBusName}" ]
+        - Statement:
+            # PREFIX-SCOPED, not bucket-wide. (SECURITY-06)
+            - Sid: EventAndLibraryFilesObjects
+              Effect: Allow
+              Action: [ s3:PutObject, s3:GetObject, s3:DeleteObject ]
+              Resource:
+                - !If [ HasBucket, !Sub "${FileShareBucketArn}/events/*", '*' ]
+                - !If [ HasBucket, !Sub "${FileShareBucketArn}/library/*", '*' ]
+            - Sid: EventAndLibraryFilesList
+              Effect: Allow
+              Action: s3:ListBucket
+              Resource: !If [ HasBucket, !Ref FileShareBucketArn, '*' ]
+              Condition:
+                StringLike:
+                  s3:prefix: [ "events/*", "library/*" ]
+
+  # ---- branch 3: Identity & Access group soft-delete (BR-X3) ----------------
+  GroupEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "events-group-deleted-${Stage}"
+      EventBusName: !Ref EventBusName
+      EventPattern:
+        detail-type: [ GroupSoftDeleted ]
+      State: ENABLED
+      Targets:
+        - Id: events-group-consumer
+          Arn: !GetAtt Fn.Arn
+  GroupEventRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GroupEventRule.Arn
+
+  # ---- Content Library Path 2: ContributionApproved consumer (US-2.24) ------
+  ContributionApprovedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "library-contribution-approved-${Stage}"
+      EventBusName: !Ref EventBusName
+      EventPattern:
+        detail-type: [ ContributionApproved ]
+      State: ENABLED
+      Targets:
+        - Id: library-contribution-consumer
+          Arn: !GetAtt Fn.Arn
+  ContributionApprovedRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ContributionApprovedRule.Arn
+
+  # ---- branch 4a: S3 object events, PREFIX-FILTERED (finding F3) ------------
+  # Covers both events/ and library/ prefixes. Settings' rule carries its own
+  # prefix filter so services don't cross-contaminate idempotency records.
+  ObjectRule:
+    Type: AWS::Events::Rule
+    Condition: HasBucket
+    Properties:
+      Name: !Sub "events-object-events-${Stage}"
+      EventPattern:
+        source: [ aws.s3 ]
+        detail-type:
+          - Object Created
+          - Object Deleted
+        detail:
+          bucket:
+            name: [ !Ref FileShareBucketName ]
+          object:
+            key:
+              - prefix: "events/"
+              - prefix: "library/"
+      State: ENABLED
+      Targets:
+        - Id: events-object-consumer
+          Arn: !GetAtt Fn.Arn
+  ObjectRulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasBucket
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ObjectRule.Arn
+
+  # ---- branch 4b: GuardDuty malware scan results (N1) ----------------------
+  # Covers both events/ and library/ prefixes (Content Library rework 2026-08-18).
+  MalwareScanRule:
+    Type: AWS::Events::Rule
+    Condition: HasBucket
+    Properties:
+      Name: !Sub "events-malware-scan-${Stage}"
+      EventPattern:
+        source: [ aws.guardduty ]
+        detail-type:
+          - GuardDuty Malware Protection Object Scan Result
+        detail:
+          s3ObjectDetails:
+            objectKey:
+              - prefix: "events/"
+              - prefix: "library/"
+      State: ENABLED
+      Targets:
+        - Id: events-scan-consumer
+          Arn: !GetAtt Fn.Arn
+  MalwareScanRulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasBucket
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MalwareScanRule.Arn
+
+  # ---- alarms (P-OBS-1) ----------------------------------------------------
+  # Beyond the first two, these cover conditions where the API looks healthy to
+  # callers while something is wrong, which is exactly why they need alarms
+  # rather than error-rate monitoring.
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [ { Name: FunctionName, Value: !Ref Fn } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  ThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [ { Name: FunctionName, Value: !Ref Fn } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  PublicUpload4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        Elevated 4xx on the unauthenticated /event-uploads mint — the portal's
+        only public write path. A sustained rate means token guessing.
+      Namespace: !Sub "CommunityPortal/events-${Stage}"
+      MetricName: PublicUpload4xx
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 20
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  AuthzFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Sustained 403s — probing, or a regression in the three-layer authz.
+      Namespace: !Sub "CommunityPortal/events-${Stage}"
+      MetricName: AuthorizationFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 25
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  MalwareDetectedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        A threat reached the community bucket. The material is quarantined and
+        hidden, but an operator needs to know rather than only a hidden row.
+      Namespace: !Sub "CommunityPortal/events-${Stage}"
+      MetricName: MalwareDetected
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  FanOutFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        Point-value reads to Contributions are failing. Pages still render with
+        the points tag hidden (by design), so this is invisible to users and must
+        be visible operationally.
+      Namespace: !Sub "CommunityPortal/events-${Stage}"
+      MetricName: ContributionsFanOutFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  LibraryContributionConsumerFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        ContributionApproved events failing to create Library resources.
+        Silent to the approver — must be visible operationally.
+      Namespace: !Sub "CommunityPortal/events-${Stage}"
+      MetricName: LibraryContributionConsumerFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/*"
+  # Second permission, for the PRIVATE API. SourceArn pins a permission to a
+  # single api id, so the public one above does NOT cover requests arriving
+  # through the private API — without this they fail with API Gateway unable to
+  # invoke the function.
+  PrivateApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/*"
+
+  # ── Silent-degradation signals ────────────────────────────────────────────
+  # Every fail-soft path below logs a warning, substitutes a fallback and returns
+  # success, so without these the degradation is invisible: the caller gets a 200
+  # containing quietly wrong data. Added after finding 49 unnoticed membership-
+  # lookup timeouts in forums over four days.
+  #
+  # PLAIN-TEXT filter patterns on purpose. get_logger() attaches the JSON
+  # formatter only to the logger it names (propagate=False), so modules using
+  # logging.getLogger(__name__) emit Lambda's default TEXT format. A JSON
+  # { $.message = ... } pattern matches nothing there; a quoted substring matches
+  # both formats.
+  #
+  # Explicit log group because Lambda only auto-creates it on first invocation,
+  # so a metric filter cannot attach on a fresh install without it. It also
+  # replaces an auto-created group that had NO retention policy at all.
+  FnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/events-${Stage}"
+      RetentionInDays: 30
+      KmsKeyId: !Ref LogsKmsKeyArn
+  AuthzDegradationsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # authorisation computed from stale or default data instead of live state
+      FilterPattern: '?"designee role lookup failed" ?"settings read failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/Events
+          MetricName: AuthzDegradations
+          MetricValue: '1'
+  AuthzDegradationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "authorisation computed from stale or default data instead of live state"
+      Namespace: Portal/Events
+      MetricName: AuthzDegradations
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: absent data means no calls were attempted, NOT that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA when idle.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  LostDomainEventsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # a domain event was dropped after its write committed, so downstream projections diverge
+      FilterPattern: '?"event publish failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/Events
+          MetricName: LostDomainEvents
+          MetricValue: '1'
+  LostDomainEventsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "a domain event was dropped after its write committed, so downstream projections diverge"
+      Namespace: Portal/Events
+      MetricName: LostDomainEvents
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: absent data means no calls were attempted, NOT that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA when idle.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  FanOutFailuresMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # a cross-service read failed, so the response is missing fields but still returned 200
+      FilterPattern: '?"contributions call failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/Events
+          MetricName: FanOutFailures
+          MetricValue: '1'
+  FanOutFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "a cross-service read failed, so the response is missing fields but still returned 200"
+      Namespace: Portal/Events
+      MetricName: FanOutFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: absent data means no calls were attempted, NOT that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA when idle.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+Outputs:
+  FunctionArn: { Value: !GetAtt Fn.Arn }

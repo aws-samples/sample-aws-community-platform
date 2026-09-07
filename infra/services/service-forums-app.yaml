@@ -1,0 +1,318 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: App stack for forums (Lambda + EventBridge + Scheduler + alarms).
+Parameters:
+  Stage: { Type: String, Default: dev }
+  RestApiId: { Type: String }
+  # The private twin of RestApiId. Same route table, reachable only from
+  # inside the VPC through the execute-api interface endpoint.
+  PrivateRestApiId: { Type: String }
+  RootResourceId: { Type: String }
+  EventBusName: { Type: String }
+  TableName: { Type: String }
+  TableArn: { Type: String }
+  IdempotencyTableName: { Type: String }
+  EnableSemanticSearch: { Type: String, Default: 'false' }
+  OpsAlarmTopicArn: { Type: String }
+  ApiBaseUrl: { Type: String }
+  PrivateSubnetIds: { Type: CommaDelimitedList }
+  LambdaSecurityGroupId: { Type: String }
+  # CMK from the foundation stack for the log group(s) below. Required (no
+  # Default): an empty string is not a valid KmsKeyId, so a missing value must
+  # fail at deploy time rather than silently produce an unencrypted log group.
+  LogsKmsKeyArn: { Type: String }
+  # Managed policy from foundation granting DynamoDB-mediated use of the table
+  # CMK. Required (no Default): without it every DynamoDB call from these
+  # functions fails with a KMS AccessDenied once the key policy's wildcard
+  # statement is removed.
+  DynamoDbKmsAccessPolicyArn: { Type: String }
+  # SQS CMK + its use policy from the Keys stack. Required (no Default):
+  # an empty KmsMasterKeyId is not valid, and a queue silently falling back
+  # to no encryption is exactly what this change exists to prevent.
+  SqsKmsKeyArn: { Type: String }
+  SqsKmsAccessPolicyArn: { Type: String }
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 512
+    Timeout: 900
+    Tracing: Active
+Resources:
+  Fn:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "forums-${Stage}"
+      Handler: app.handler
+      CodeUri: ../../dist/forums.zip
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTableName
+          EVENT_BUS_NAME: !Ref EventBusName
+          ENABLE_SEMANTIC_SEARCH: !Ref EnableSemanticSearch
+          API_BASE_URL: !Ref ApiBaseUrl
+          MENTION_TIMEOUT_MS: '1500'
+          SWEEP_TIME_CAP_SECONDS: '600'
+          RATE_LIMIT_POST_PER_HOUR: '10'
+          RATE_LIMIT_REPLY_PER_HOUR: '30'
+          MENTION_CAP: '25'
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - !Ref SqsKmsAccessPolicyArn
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+                - dynamodb:Scan
+                - dynamodb:BatchWriteItem
+                - dynamodb:BatchGetItem
+              Resource:
+                - !Ref TableArn
+                - !Sub "${TableArn}/index/*"
+            - Effect: Allow
+              Action: [ dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem ]
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IdempotencyTableName}"
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EventBusName}"
+            - Effect: Allow
+              Action: execute-api:Invoke
+              Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/GET/members*"
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt ConsumerDLQ.Arn
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/*"
+  # Second permission, for the PRIVATE API. SourceArn pins a permission to a
+  # single api id, so the public one above does NOT cover requests arriving
+  # through the private API — without this they fail with API Gateway unable to
+  # invoke the function.
+  PrivateApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/*"
+
+  # --- EventBridge: group lifecycle consumer ---
+  GroupLifecycleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref EventBusName
+      EventPattern:
+        source: [ "identity-access" ]
+        detail-type: [ "GroupCreated", "GroupHardDeleted", "GroupSoftDeleted", "GroupRestored" ]
+      Targets:
+        - Id: ForumsConsumer
+          Arn: !GetAtt Fn.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt ConsumerDLQ.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 3
+            MaximumEventAgeInSeconds: 86400
+
+  EventBridgeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GroupLifecycleRule.Arn
+
+  # SSE-KMS with the shared SQS CMK (Keys stack). Swapped from SqsManagedSseEnabled
+  # — which was itself added here late, this DLQ having once been the only
+  # unencrypted queue in the platform. KmsMasterKeyId and SqsManagedSseEnabled are
+  # mutually exclusive; both Checkov CKV_AWS_27 and cfn_nag W48 inspect only the
+  # former. A customer key rather than alias/aws/sqs because EVENTBRIDGE writes this
+  # queue (DeadLetterConfig on the rule below) and must be granted in the key
+  # policy, which cannot be edited on an AWS-managed key. See keys.yaml SqsKmsKey.
+  ConsumerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !Ref SqsKmsKeyArn
+      KmsDataKeyReusePeriodSeconds: 86400
+      MessageRetentionPeriod: 1209600
+
+  # --- EventBridge Scheduler: nightly sweep ---
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref SchedulerInvokePolicy
+
+  # Customer-managed rather than an inline `Policies` list on the role above:
+  # cfn-guard IAM_NO_INLINE_POLICY_CHECK (and AWS Config iam-no-inline-policy-check)
+  # reject inline policies on IAM roles however narrow they are, and this one is a
+  # single action on a single function ARN. Permissions are unchanged.
+  #
+  # Attached via the role's ManagedPolicyArns rather than this policy's `Roles`
+  # list so the attachment is part of the role's own creation: SweepSchedule below
+  # takes !GetAtt SchedulerRole.Arn, and a `Roles` list would let that schedule be
+  # created against a role that is not yet permitted to invoke the function.
+  SchedulerInvokePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      # ManagedPolicyName deliberately NOT set — an explicit name triggers cfn_nag
+      # W28 and Ref already returns the ARN.
+      Description: Invoke the forums function from EventBridge Scheduler.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !GetAtt Fn.Arn
+
+  SweepSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "forums-sweep-${Stage}"
+      ScheduleExpression: "cron(0 3 * * ? *)"
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt Fn.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"source": "scheduler", "action": "sweep"}'
+
+  # --- Alarms ---
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [ { Name: FunctionName, Value: !Ref Fn } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+  ThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [ { Name: FunctionName, Value: !Ref Fn } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [ { Name: QueueName, Value: !GetAtt ConsumerDLQ.QueueName } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+
+  # ── Silent-degradation signals ────────────────────────────────────────────
+  # Every fail-soft path below logs a warning, substitutes a fallback and returns
+  # success, so without these the degradation is invisible: the caller gets a 200
+  # containing quietly wrong data. Added after finding 49 unnoticed membership-
+  # lookup timeouts in forums over four days.
+  #
+  # PLAIN-TEXT filter patterns on purpose. get_logger() attaches the JSON
+  # formatter only to the logger it names (propagate=False), so modules using
+  # logging.getLogger(__name__) emit Lambda's default TEXT format. A JSON
+  # { $.message = ... } pattern matches nothing there; a quoted substring matches
+  # both formats.
+  #
+  # Explicit log group because Lambda only auto-creates it on first invocation,
+  # so a metric filter cannot attach on a fresh install without it. It also
+  # replaces an auto-created group that had NO retention policy at all.
+  FnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/forums-${Stage}"
+      RetentionInDays: 30
+      KmsKeyId: !Ref LogsKmsKeyArn
+  AuthzDegradationsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # authorisation computed from stale or default data instead of live state
+      FilterPattern: '?"membership lookup failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/Forums
+          MetricName: AuthzDegradations
+          MetricValue: '1'
+  AuthzDegradationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "authorisation computed from stale or default data instead of live state"
+      Namespace: Portal/Forums
+      MetricName: AuthzDegradations
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: absent data means no calls were attempted, NOT that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA when idle.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  FanOutFailuresMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # a cross-service read failed, so the response is missing fields but still returned 200
+      FilterPattern: '?"mention validation failed" ?"mentionSuggest failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/Forums
+          MetricName: FanOutFailures
+          MetricValue: '1'
+  FanOutFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "a cross-service read failed, so the response is missing fields but still returned 200"
+      Namespace: Portal/Forums
+      MetricName: FanOutFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: absent data means no calls were attempted, NOT that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA when idle.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+Outputs:
+  FunctionArn: { Value: !GetAtt Fn.Arn }
+  FunctionName: { Value: !Ref Fn }

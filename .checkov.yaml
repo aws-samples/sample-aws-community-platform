@@ -1,0 +1,156 @@
+# Checkov IaC scanner configuration
+# See: https://www.checkov.io/2.Basics/CLI%20Command%20Reference.html
+#
+# SUPPRESSION RATIONALE (community portal — dev environment)
+# All suppressions are documented below. Findings marked as "address" are
+# tracked separately and NOT listed here.
+
+skip-check:
+  # ── DynamoDB KMS Customer Managed Key ────────────────────────────────────
+  # CKV_AWS_119: AWS-managed SSE (SSEEnabled: true) is in place on all tables.
+  # CMK adds ~$1/key/month per table with no compliance requirement for a
+  # community portal. AWS-managed keys provide equivalent encryption at rest.
+  - CKV_AWS_119
+
+  # ── DynamoDB Point-In-Time Recovery ──────────────────────────────────────
+  # CKV_AWS_28: PITR is already enabled on tables holding original records
+  # (events, contributions, certifications, identity-access). Remaining tables
+  # are derived caches or small reconstructable datasets (analytics,
+  # notifications, search, help-assistant) where PITR adds cost without
+  # meaningful recovery value.
+  - CKV_AWS_28
+
+  # ── Lambda Dead Letter Queue ──────────────────────────────────────────────
+  # CKV_AWS_116: DLQs apply to asynchronous Lambda invocations. The flagged
+  # functions are synchronous HTTP API handlers (API Gateway proxy) — DLQs
+  # have no effect on synchronous invocations. Services with async consumers
+  # (SQS-triggered) already have DLQs configured explicitly.
+  - CKV_AWS_116
+
+  # ── Lambda Reserved Concurrency ──────────────────────────────────────────
+  # CKV_AWS_115: On-demand scaling is appropriate for a community portal at
+  # this stage. Reserved concurrency is a cost and isolation tradeoff suited
+  # to high-scale production workloads. Will be revisited at production
+  # readiness review.
+  - CKV_AWS_115
+
+  # ── Lambda Environment Variable Encryption ───────────────────────────────
+  # CKV_AWS_173: Lambda environment variables are encrypted at rest using
+  # AWS-managed keys by default. The variables contain non-secret config
+  # (table names, bus names, URLs) — no secret values are stored in env vars.
+  # CMK adds operational overhead (key rotation, cross-account) with no
+  # security benefit for these non-secret configuration values.
+  - CKV_AWS_173
+
+  # ── Lambda VPC Placement ─────────────────────────────────────────────────
+  # CKV_AWS_117: Only services that access VPC-resident resources (all real
+  # services with DynamoDB in private subnets) are in the VPC. The flagged
+  # Lambdas are stateless utilities (seed, search, analytics, notifications)
+  # that don't require VPC isolation. Adding VPC increases cold start latency
+  # and requires NAT Gateway for internet access, adding cost without benefit.
+  - CKV_AWS_117
+
+  # ── CloudWatch Log Group KMS Encryption ──────────────────────────────────
+  # CKV_AWS_158: CloudWatch Log Groups use AWS-managed encryption by default.
+  # KMS CMK for logs is an advanced compliance requirement (FedRAMP, HIPAA)
+  # not applicable to a community portal. Cost: ~$0.03/GB additional.
+  - CKV_AWS_158
+
+  # ── API Gateway Caching ───────────────────────────────────────────────────
+  # CKV_AWS_120: API caching is intentionally disabled. This portal serves
+  # real-time data (event RSVPs, contribution approvals, notifications) where
+  # stale cached responses would cause correctness issues. Caching was
+  # evaluated and rejected (AC-2 in architecture decisions).
+  - CKV_AWS_120
+
+  # ── CloudFront Access Logging ─────────────────────────────────────────────
+  # CKV_AWS_86 suppression REMOVED — no longer needed. The rationale said logging
+  # "will be added at production readiness"; it has since been added and is live.
+  # SpaDistribution now has a Logging block delivering to CloudFrontLogBucket, so
+  # the check passes on its own terms and a suppression would only hide a
+  # regression if someone removed it again.
+
+  # ── CloudFront TLS Version ────────────────────────────────────────────────
+  # CKV_AWS_174: TLS 1.2 is the CloudFront default for viewer certificates.
+  # The distribution uses the default CloudFront certificate which already
+  # enforces TLS 1.2 minimum.
+  - CKV_AWS_174
+
+  # ── CloudFront WAF ────────────────────────────────────────────────────────
+  # CKV_AWS_68: WAF was explicitly descoped (AC-1) in the architecture
+  # decisions. Cognito throttling and API Gateway rate limiting provide
+  # baseline protection. WAF adds ~$5/month base + $0.60/million requests.
+  - CKV_AWS_68
+
+  # ── S3 Versioning ────────────────────────────────────────────────────────
+  # CKV_AWS_21: The SPA bucket contains only static build artifacts that are
+  # fully regenerated and replaced on every deployment. Versioning adds
+  # storage cost with no recovery value — old versions are superseded by
+  # new builds, not recovered.
+  - CKV_AWS_21
+
+  # ── S3 Access Logging ────────────────────────────────────────────────────
+  # CKV_AWS_18: applies to ONE resource — foundation.yaml's AccessLogBucket,
+  # which IS the server-access-log destination for every other bucket in the
+  # solution and is therefore the terminal node of the logging chain.
+  #
+  # It cannot log anywhere. Pointing it at itself is what creates the recursive
+  # loop S3 warns about (each log write is an access, which generates another log
+  # write); pointing it at a further log bucket just moves this same finding onto
+  # that bucket, with no endpoint. Some bucket has to terminate the chain, and
+  # this is the one that should: private (all four public-access blocks),
+  # SSE-S3 encrypted, TLS-only via an explicit DenyNonTlsRequests policy, writes
+  # restricted to logging.s3.amazonaws.com under an aws:SourceAccount condition,
+  # and 90-day object expiry. Object-level read/write visibility, if ever needed,
+  # comes from CloudTrail S3 data events rather than server access logging.
+  #
+  # The other buckets are REMEDIATED, not suppressed — SpaBucket and
+  # CloudFrontLogBucket (api-edge) and FileShareBucket and UserExportBucket
+  # (foundation) all deliver access logs into AccessLogBucket under distinct
+  # prefixes. If a new bucket is added, wire it up rather than widening this
+  # entry.
+  - CKV_AWS_18
+
+  # ── SQS Encryption ───────────────────────────────────────────────────────
+  # CKV_AWS_27 suppression REMOVED — REMEDIATED instead. All 8 queues moved from
+  # SSE-SQS (SqsManagedSseEnabled) to SSE-KMS with a customer managed key,
+  # SqsKmsKey in infra/keys.yaml.
+  #
+  # The old rationale ("SQS uses AWS-managed SSE by default") was misleading twice
+  # over: the encryption was explicitly configured rather than incidental, and the
+  # real reason the check fired is that CKV_AWS_27's CloudFormation implementation
+  # inspects only Properties/KmsMasterKeyId — SSE-SQS could never satisfy it, at
+  # any Checkov version. (Its Terraform implementation of the same check id DOES
+  # accept sqs_managed_sse_enabled; only the CFN checker was never updated.)
+  #
+  # A customer key rather than alias/aws/sqs is not a preference: EventBridge writes
+  # 4 of the 8 queues and must be granted in the KEY POLICY, which is not editable
+  # on an AWS-managed key. See the SqsKmsKey comment for the full reasoning.
+
+  # ── SNS Encryption ───────────────────────────────────────────────────────
+  # CKV_AWS_26: SNS topic used for ops alarms only. AWS-managed encryption
+  # is sufficient. No PII or sensitive data flows through the ops alarm topic.
+  - CKV_AWS_26
+
+  # ── Secrets Manager KMS CMK ──────────────────────────────────────────────
+  # CKV_AWS_149 suppression REMOVED — the resource no longer exists. The
+  # bootstrap-admin secret was deleted along with all Secrets Manager use: the
+  # seeder now generates the admin password, sets it PERMANENT and discards it,
+  # and the operator arrives via "Forgot password". There is no
+  # AWS::SecretsManager::Secret left in any template for this check to fire on.
+
+  # ── OpenAPI Global Security Field ────────────────────────────────────────
+  # CKV_OPENAPI_4 / CKV_OPENAPI_5: Security enforcement is configured at the
+  # API Gateway level (Cognito authorizer in api-edge.yaml) for all routes
+  # except explicitly public ones (/auth, /public, /event-uploads). The
+  # OpenAPI contract files describe API shapes only — they are not deployed
+  # as the actual security mechanism.
+  - CKV_OPENAPI_4
+  - CKV_OPENAPI_5
+
+  # ── OpenAPI Array maxItems ────────────────────────────────────────────────
+  # CKV_OPENAPI_21: Server-side validation enforces limits on all array
+  # inputs (pagination caps, GROUP_IDS limits, etc.). maxItems in OpenAPI
+  # schema is informational and does not add server-side protection beyond
+  # what is already implemented.
+  - CKV_OPENAPI_21

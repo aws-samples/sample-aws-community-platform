@@ -1,0 +1,294 @@
+openapi: 3.0.3
+info: { title: Contributions & Scoring API, version: 2.0.0 }
+# v2.0.0 (Unit 7 construction): expanded framework (activities + event points +
+# tiers), rich member points/history, leaderboard (rank/name/avatar/pillar),
+# summary (pillars/counts/top-N/computedAt), aggregated export, quarter-selectable
+# adjustments + reverse, member ledger (reverse browser), tiers-earned (profile
+# badges). GET /contributions/me PRESERVES the fields Member-Profiles' deployed
+# fan-out reads (points, quarter, groupId, tier, submissionCount).
+paths:
+  /contributions/framework:
+    get:
+      operationId: getFramework
+      x-mock-collection: framework
+      responses: { '200': { description: Framework (activities+eventPoints+tiers), content: { application/json: { schema: { $ref: '#/components/schemas/Framework' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+    post:
+      operationId: createActivity
+      x-mock-collection: framework
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [activity, pillar, points], properties: { activity: { type: string }, description: { type: string }, pillar: { type: integer }, points: { type: integer } } } } } }
+      responses: { '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Activity' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/framework/{id}:
+    put:
+      operationId: editActivity
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { activity: { type: string }, description: { type: string }, pillar: { type: integer }, points: { type: integer }, active: { type: boolean } } } } } }
+      responses: { '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Activity' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+    delete:
+      operationId: deleteActivity
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: Deleted }, '400': { $ref: '#/components/responses/Bad' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/event-points/{eventType}:
+    put:
+      operationId: editEventPoints
+      parameters: [{ name: eventType, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [attendancePoints, deliveryPoints], properties: { attendancePoints: { type: integer }, deliveryPoints: { type: integer } } } } } }
+      responses: { '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/EventPoints' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/tiers:
+    put:
+      operationId: editTiers
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [tiers], properties: { tiers: { type: array, items: { $ref: '#/components/schemas/Tier' } } } } } } }
+      responses: { '200': { description: Updated, content: { application/json: { schema: { type: object, properties: { tiers: { type: array, items: { $ref: '#/components/schemas/Tier' } } } } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/me:
+    get:
+      operationId: getOwnPoints
+      x-mock-collection: rollups
+      parameters: [{ name: memberId, in: query, schema: { type: string } }, { name: groupId, in: query, schema: { type: string } }, { name: quarter, in: query, schema: { type: string } }]
+      responses: { '200': { description: My points/tier (rich member view; back-compat fields preserved), content: { application/json: { schema: { $ref: '#/components/schemas/MyPoints' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/history:
+    get:
+      operationId: getHistory
+      x-mock-collection: ledger
+      parameters: [{ name: memberId, in: query, schema: { type: string } }, { name: quarter, in: query, schema: { type: string } }, { name: scope, in: query, schema: { type: string, enum: [quarter, all] } }]
+      responses: { '200': { description: Points history, content: { application/json: { schema: { $ref: '#/components/schemas/LedgerList' } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/tiers-earned:
+    get:
+      operationId: tiersEarned
+      x-mock-collection: rollups
+      parameters: [{ name: memberId, in: query, required: true, schema: { type: string } }]
+      responses: { '200': { description: Historical per-group/per-quarter tier badges, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/TierBadge' } }, count: { type: integer } } } } } }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/leaderboard:
+    get:
+      operationId: getLeaderboard
+      x-mock-collection: rollups
+      parameters: [{ name: groupId, in: query, schema: { type: string } }, { name: quarter, in: query, schema: { type: string } }, { name: pillar, in: query, schema: { type: integer } }, { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 1000 } }]
+      responses: { '200': { description: Leaderboard (top-N, B3-filtered), content: { application/json: { schema: { $ref: '#/components/schemas/LeaderboardList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/rollups:
+    get:
+      operationId: getRollups
+      x-mock-collection: rollups
+      description: Points + tier for a specific set of members in one group+quarter (BatchGetItem), used to hydrate the Points/Tier columns of a member table page. Members with no rollup are omitted.
+      parameters: [{ name: groupId, in: query, required: true, schema: { type: string } }, { name: memberIds, in: query, required: true, description: 'Comma-separated member ids (max 100).', schema: { type: string } }, { name: quarter, in: query, schema: { type: string } }]
+      responses: { '200': { description: Rollups for the requested members, content: { application/json: { schema: { $ref: '#/components/schemas/RollupList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/summary/{scope}:
+    get:
+      operationId: getSummary
+      x-mock-collection: rollups
+      parameters: [{ name: scope, in: path, required: true, schema: { type: string, enum: [group, community] } }, { name: groupId, in: query, schema: { type: string } }, { name: quarter, in: query, schema: { type: string } }]
+      responses: { '200': { description: Group/community summary (nightly fields carry computedAt), content: { application/json: { schema: { $ref: '#/components/schemas/Summary' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/group-trend:
+    get:
+      operationId: groupTrend
+      x-mock-collection: rollups
+      description: >-
+        Per-quarter active-member counts and points for ONE group, oldest first, plus the tier
+        distribution for a single selected quarter (US-7.2/7.3). Computed from the live per-quarter
+        rollups, not the nightly sweep, so the dashboard shows current data on every load.
+        A User Group Leader always gets their own led group regardless of groupId; a Community
+        Leader may name any group; no other role may call this.
+      parameters:
+        - { name: groupId, in: query, schema: { type: string }, description: 'Community Leader only — ignored for a UGL, whose led group is taken from their token.' }
+        - { name: quarters, in: query, schema: { type: integer, minimum: 1, maximum: 12, default: 4 }, description: 'Size of the trailing window.' }
+        - { name: quarter, in: query, schema: { type: string }, description: 'Quarter whose tier distribution is returned; defaults to the current quarter.' }
+      responses: { '200': { description: Group trend, content: { application/json: { schema: { $ref: '#/components/schemas/GroupTrend' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/community-trend:
+    get:
+      operationId: communityTrend
+      x-mock-collection: rollups
+      description: >-
+        Per-quarter active-member counts and points COMMUNITY-WIDE, oldest first (US-7.1/7.3).
+        Community Leader only. `activeMembers` comes from the nightly sweep, the only place a
+        community-wide DISTINCT member count exists — summing per-group counts would double-count
+        anyone belonging to two groups — so a quarter the sweep has never covered returns null
+        rather than a misleading zero, and `computedAt` lets the UI label the series honestly.
+        `totalPoints` is read live from the community rollup and needs no sweep.
+      parameters:
+        - { name: quarters, in: query, schema: { type: integer, minimum: 1, maximum: 12, default: 4 }, description: 'Size of the trailing window.' }
+      responses: { '200': { description: Community trend, content: { application/json: { schema: { $ref: '#/components/schemas/CommunityTrend' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/group-ledger:
+    get:
+      operationId: groupLedger
+      x-mock-collection: ledger
+      description: >-
+        One PAGE of a group's individual point entries for a quarter, newest first (US-7.9).
+        Cursor-paginated against a group-scoped index because a busy group holds 13,000+ entries
+        per quarter — the response never exceeds `limit` rows. A User Group Leader always gets the
+        group they lead whatever groupId says; a Community Leader may name a group; no other role
+        may call this. `memberEmail` is resolved from the member projection for the rows on the
+        page; `activity` falls back to an adjustment's reason, since adjustments have no activity.
+      parameters:
+        - { name: groupId, in: query, schema: { type: string }, description: 'Community Leader only — ignored for a UGL.' }
+        - { name: quarter, in: query, schema: { type: string }, description: 'Defaults to the current quarter.' }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 25 } }
+        - { name: cursor, in: query, schema: { type: string }, description: 'Opaque cursor from the previous page.' }
+        - { name: memberId, in: query, schema: { type: string }, description: 'Point Ledger filter (US-7.9) — narrow to one member.' }
+        - { name: source, in: query, schema: { type: string }, description: 'Point Ledger filter — CSV of auto|evidence|adjustment (OR within the set). Omit for all.' }
+        - { name: activityType, in: query, schema: { type: string }, description: 'Point Ledger filter — CSV of activity categories: event-attendance|event-delivery|certification|other-auto|evidence|adjustment. Omit for all.' }
+      responses: { '200': { description: One page of group point entries, content: { application/json: { schema: { $ref: '#/components/schemas/GroupLedgerList' } } } }, '400': { $ref: '#/components/responses/Bad' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/group-ledger/export:
+    post:
+      operationId: startPointLedgerExport
+      description: >-
+        Start an ASYNC Point Ledger CSV export and return the job id immediately (US-7.9).
+        Replaces a client-side cursor walk that held every row in the browser, gave no
+        progress, produced a silently truncated file if the tab navigated away, and stopped
+        at 100k rows. Honours the same filters as the table so the CSV matches what the
+        leader is looking at. Scope is fail-closed exactly as on groupLedger: a UGL always
+        exports the group they lead whatever groupId says; a CL must name a group; no other
+        role may call this. ONE in-flight export per account — a second start returns 400.
+        `groupName` is accepted for the CSV's user_group column only: this service stores
+        group ids, never names, and the value never affects which rows are exported.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quarter]
+              properties:
+                groupId: { type: string, description: 'Required for a Community Leader; ignored for a UGL.' }
+                quarter: { type: string, description: 'e.g. 2026-Q3.' }
+                groupName: { type: string, description: 'Display name for the user_group column. Display-only.' }
+                memberId: { type: string }
+                source: { type: string, description: 'CSV of auto|evidence|adjustment.' }
+                activityType: { type: string, description: 'CSV of activity categories.' }
+      responses:
+        '202': { description: Export job accepted, content: { application/json: { schema: { $ref: '#/components/schemas/PointLedgerExportJob' } } } }
+        '400': { $ref: '#/components/responses/Bad' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NI' }
+  /contributions/group-ledger/export/{jobId}:
+    get:
+      operationId: getPointLedgerExport
+      description: >-
+        Progress for an export job; once `status` is ready the response carries a freshly
+        minted, short-lived presigned download URL. The URL is created per request and never
+        stored — a URL signed with this Lambda's session credentials dies with them and
+        cannot be revoked. Another leader's job is reported as 404, not 403, so the response
+        cannot confirm that a job id exists. There is no delete-on-download: a presigned GET
+        is a direct browser-to-S3 transfer this service never observes completing, so cleanup
+        is the export bucket's 1-day lifecycle rule.
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Job status, content: { application/json: { schema: { $ref: '#/components/schemas/PointLedgerExportJob' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: No such job for this caller }
+        '501': { $ref: '#/components/responses/NI' }
+  /contributions/export:
+    get:
+      operationId: exportContributions
+      x-mock-collection: ledger
+      parameters: [{ name: scope, in: query, schema: { type: string } }, { name: groupId, in: query, schema: { type: string } }, { name: quarter, in: query, schema: { type: string } }, { name: from, in: query, schema: { type: string } }, { name: to, in: query, schema: { type: string } }]
+      responses: { '200': { description: Aggregated CSV rows (one per member per group — US-6.14), content: { application/json: { schema: { $ref: '#/components/schemas/ExportList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/ledger:
+    get:
+      operationId: memberLedger
+      x-mock-collection: ledger
+      parameters: [{ name: memberId, in: query, required: true, schema: { type: string } }, { name: groupId, in: query, schema: { type: string } }]
+      responses: { '200': { description: A member's ledger entries (reverse browser), content: { application/json: { schema: { $ref: '#/components/schemas/LedgerList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/submissions:
+    get:
+      operationId: listOwnSubmissions
+      x-mock-collection: submissions
+      responses: { '200': { description: My submissions, content: { application/json: { schema: { $ref: '#/components/schemas/SubmissionList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+    post:
+      operationId: submitContribution
+      x-mock-collection: submissions
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SubmissionInput' } } } }
+      responses: { '201': { description: Submitted, content: { application/json: { schema: { $ref: '#/components/schemas/Submission' } } } }, '400': { $ref: '#/components/responses/Bad' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/submissions/{id}:
+    delete:
+      operationId: withdrawSubmission
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: Withdrawn }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/submissions/{id}/decision:
+    post:
+      operationId: decideSubmission
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [decision], properties: { decision: { type: string, enum: [approve, reject] }, reason: { type: string }, addToLibrary: { type: boolean }, libraryTitle: { type: string }, libraryDescription: { type: string }, libraryFormat: { type: string, enum: [Slides, PDF, Doc, Recording, Link] }, libraryTopics: { type: array, items: { type: string } }, libraryUrl: { type: string }, libraryS3Key: { type: string } } } } } }
+      responses: { '200': { description: Decided }, '403': { $ref: '#/components/responses/Forbidden' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/approvals:
+    get:
+      operationId: listPending
+      x-mock-collection: submissions
+      description: >-
+        Leader approval queue, oldest-first (BR-E6), cursor-paginated. `count` is the
+        number of items on THIS page; ask with `countOnly=true` for the true total
+        outstanding. `cursor` is present only while a further page exists. Filters are
+        applied server-side so a leader can reach one member/group/activity without
+        paging a large backlog; a UGL is always confined to its led group and a
+        caller-supplied `groupId` cannot widen that scope.
+      parameters:
+        - { name: countOnly, in: query, schema: { type: boolean } }
+        - { name: limit, in: query, description: Page size 1-100 (default 25), schema: { type: integer, minimum: 1, maximum: 100 } }
+        - { name: cursor, in: query, description: Opaque forward-only page cursor from a previous response, schema: { type: string } }
+        - { name: groupId, in: query, description: Community Leader only; ignored for a User Group Leader, schema: { type: string } }
+        - { name: memberId, in: query, schema: { type: string } }
+        - { name: activityId, in: query, schema: { type: string } }
+      responses: { '200': { description: Pending approvals (or count), content: { application/json: { schema: { $ref: '#/components/schemas/SubmissionList' } } } }, '400': { $ref: '#/components/responses/Bad' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/adjustments:
+    post:
+      operationId: adjustPoints
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [memberId, groupId, delta, reason], properties: { memberId: { type: string }, groupId: { type: string }, delta: { type: integer }, reason: { type: string }, quarter: { type: string }, memberName: { type: string } } } } } }
+      responses: { '200': { description: Adjusted, content: { application/json: { schema: { $ref: '#/components/schemas/Ledger' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /contributions/adjustments/reverse:
+    post:
+      operationId: reverseEntry
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [memberId, ledgerId, earnedDate, reason], properties: { memberId: { type: string }, ledgerId: { type: string }, earnedDate: { type: string }, reason: { type: string } } } } } }
+      responses: { '200': { description: Reversed, content: { application/json: { schema: { $ref: '#/components/schemas/Ledger' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+components:
+  responses:
+    Forbidden: { description: Forbidden, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Bad: { description: Validation error, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: Not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Conflict: { description: Conflict, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NI: { description: Not yet implemented, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  schemas:
+    Activity: { type: object, required: [id, name, pillar, points], properties: { id: { type: string }, name: { type: string }, description: { type: string }, pillar: { type: integer }, points: { type: integer }, evidenceRequired: { type: boolean }, auto: { type: boolean }, active: { type: boolean }, systemDefined: { type: boolean } } }
+    EventPoints: { type: object, required: [eventType, attendancePoints, deliveryPoints], properties: { eventType: { type: string }, attendancePoints: { type: integer }, deliveryPoints: { type: integer } } }
+    Tier: { type: object, required: [tier, minPoints], properties: { tier: { type: string }, minPoints: { type: integer }, recognitionLabel: { type: string } } }
+    Framework: { type: object, required: [activities, eventPoints, tiers], properties: { activities: { type: array, items: { $ref: '#/components/schemas/Activity' } }, eventPoints: { type: array, items: { $ref: '#/components/schemas/EventPoints' } }, tiers: { type: array, items: { $ref: '#/components/schemas/Tier' } } } }
+    MyPoints: { type: object, required: [memberId, quarter, points], properties: { memberId: { type: string }, groupId: { type: string }, quarter: { type: string }, points: { type: integer }, tier: { type: string }, submissionCount: { type: integer }, lifetime: { type: integer }, daysRemaining: { type: integer }, quarters: { type: array, items: { type: string } }, groups: { type: array, items: { type: string } }, pillars: { type: object, additionalProperties: { type: integer } } } }
+    Ledger: { type: object, required: [id, memberId, groupId, points], properties: { id: { type: string }, memberId: { type: string }, memberName: { type: string }, groupId: { type: string }, activity: { type: string }, pillar: { type: integer }, points: { type: integer }, source: { type: string }, earnedDate: { type: string }, quarter: { type: string }, reason: { type: string }, reverses: { type: string } } }
+    LedgerList: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/Ledger' } }, count: { type: integer } } }
+    ExportRow: { type: object, required: [member_name, user_group, total_points], properties: { member_name: { type: string }, member_email: { type: string }, user_group: { type: string }, tier: { type: string }, total_points: { type: integer }, points_upskilling: { type: integer }, points_peer_learning: { type: integer }, points_assets_demos: { type: integer }, points_thought_leadership: { type: integer } } }
+    ExportList: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/ExportRow' } }, count: { type: integer }, quarter: { type: string } } }
+    PointLedgerExportJob:
+      type: object
+      required: [jobId, status]
+      description: >-
+        Async Point Ledger export job. Mirrors identity-access' UserExportJob so the shared
+        frontend polling hook does not need to know which service produced it. `total` and
+        `percent` are null while the row count is unknown — the filtered ledger is not counted
+        up front because that costs the same walk as the export itself, so the UI shows an
+        indeterminate bar until the job completes.
+      properties:
+        jobId: { type: string }
+        status: { type: string, enum: [queued, running, ready, failed] }
+        processed: { type: integer }
+        total: { type: integer, nullable: true }
+        percent: { type: integer, nullable: true, minimum: 0, maximum: 100 }
+        fileName: { type: string }
+        url: { type: string, description: 'Presigned GET. Present only when status is ready.' }
+        expiresInSeconds: { type: integer }
+        error: { type: string, description: 'Present only when status is failed.' }
+    LeaderboardRow: { type: object, required: [memberId, points], properties: { rank: { type: integer }, memberId: { type: string }, memberName: { type: string }, avatar: { type: string }, points: { type: integer }, tier: { type: string }, groupId: { type: string }, quarter: { type: string } } }
+    LeaderboardList: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/LeaderboardRow' } }, count: { type: integer } } }
+    RollupRow: { type: object, required: [memberId, points], properties: { memberId: { type: string }, points: { type: integer }, tier: { type: string }, groupId: { type: string }, quarter: { type: string } } }
+    RollupList: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/RollupRow' } }, count: { type: integer } } }
+    TierBadge: { type: object, required: [groupId, quarter, tier], properties: { groupId: { type: string }, quarter: { type: string }, tier: { type: string }, points: { type: integer } } }
+    GroupLedgerRow: { allOf: [ { $ref: '#/components/schemas/Ledger' }, { type: object, properties: { memberEmail: { type: string, description: 'Resolved for the rows on this page.' }, activityCategory: { type: string, description: 'Stable filter category derived from source + activity prefix (US-7.9).' }, activityCategoryLabel: { type: string } } } ] }
+    GroupLedgerList: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/GroupLedgerRow' } }, count: { type: integer, description: 'Rows on THIS page, not the quarter total.' }, quarter: { type: string }, groupId: { type: string, nullable: true }, cursor: { type: string, description: 'Present when a next page exists — pass it back as the cursor query param.' } } }
+    GroupTrendPoint: { type: object, required: [quarter, activeMembers, totalPoints], properties: { quarter: { type: string }, activeMembers: { type: integer, description: 'Members holding a rollup for that quarter, i.e. who earned at least one point in it. Includes members deactivated since, so a historical point does not change retroactively.' }, totalPoints: { type: integer } } }
+    GroupTrend: { type: object, required: [items, count], properties: { groupId: { type: string, nullable: true }, quarter: { type: string, nullable: true, description: 'Quarter the tierCounts apply to.' }, tierCounts: { type: object, additionalProperties: { type: integer }, description: 'Member count per tier for `quarter`, derived from live rollups against the current thresholds.' }, items: { type: array, items: { $ref: '#/components/schemas/GroupTrendPoint' }, description: 'Oldest quarter first — chart x-axis order.' }, count: { type: integer } } }
+    CommunityTrendPoint: { type: object, required: [quarter, totalPoints], properties: { quarter: { type: string }, activeMembers: { type: integer, nullable: true, description: 'Distinct members community-wide who earned at least one point in the quarter, from the nightly sweep. NULL when the sweep has never covered that quarter — deliberately not 0, which would read as "nobody contributed".' }, totalPoints: { type: integer, description: 'Live from the community rollup.' } } }
+    CommunityTrend: { type: object, required: [items, count], properties: { items: { type: array, items: { $ref: '#/components/schemas/CommunityTrendPoint' }, description: 'Oldest quarter first — chart x-axis order.' }, count: { type: integer }, computedAt: { type: string, nullable: true, description: 'Newest sweep timestamp across the window — the "as of" disclaimer for activeMembers.' } } }
+    Summary: { type: object, required: [quarter, totalPoints], properties: { quarter: { type: string }, totalPoints: { type: integer }, pillars: { type: object, additionalProperties: { type: integer } }, tierDistribution: { type: object, additionalProperties: { type: integer }, description: 'Members per tier. Counts DISTINCT members — community-wide a member in several groups appears once, at their highest single-group total (DL18) — so it reconciles with activeContributors.' }, activeContributors: { type: integer, description: 'Distinct members who earned at least one point in the quarter; excludes deactivated members.' }, unranked: { type: integer, description: 'Contributors whose net total reaches no tier (e.g. a negative adjustment). tierDistribution + unranked == activeContributors, so a donut always reconciles with its centre.' }, topContributors: { type: array, items: { $ref: '#/components/schemas/LeaderboardRow' } }, computedAt: { type: string, description: 'Nightly (DL14) — surfaced as the "as of" disclaimer.' } } }
+    Submission: { type: object, required: [id, activity, status], properties: { id: { type: string }, memberId: { type: string }, memberName: { type: string }, groupId: { type: string }, activity: { type: string }, pillar: { type: integer }, description: { type: string }, evidence: { type: string }, activityDate: { type: string }, status: { type: string }, submittedAt: { type: string }, decidedAt: { type: string }, rejectionReason: { type: string } } }
+    SubmissionInput: { type: object, required: [activity, groupId, evidence], properties: { activity: { type: string }, groupId: { type: string }, description: { type: string }, evidence: { type: string }, activityDate: { type: string } } }
+    # `cursor` is set only by the paginated approval queue and only while a further
+    # page exists; its ABSENCE is what the client reads as "no more pages", so it
+    # must never be emitted as null/empty. /contributions/submissions is member-scoped
+    # and unpaginated, so it never sets it.
+    SubmissionList: { type: object, required: [count], properties: { items: { type: array, items: { $ref: '#/components/schemas/Submission' } }, count: { type: integer }, cursor: { type: string } } }
+    Error: { type: object, required: [code, message], properties: { code: { type: string }, message: { type: string }, correlationId: { type: string }, details: { type: array, items: { type: object } } } }

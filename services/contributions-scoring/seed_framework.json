@@ -1,0 +1,31 @@
+{
+  "_comment": "Default scoring framework seeded at install (DL16, Q12=A). Written into the main table by the platform seed handler's reference-data extension point (platform/seed/seed_handler.py). All activities Active. Event points normalized to delivery = 2x attendance. Tiers Gold/Silver/Bronze/Rising = 75/50/25/0. Auto-award works day one before any CL edit.",
+  "activities": [
+    { "sk": "ACT#certification-approval", "activityId": "certification-approval", "name": "Certification approval", "pillar": 1, "points": 0, "evidenceRequired": false, "active": true, "systemDefined": true, "note": "points are per-certification (US-6.5), not a framework value" },
+    { "sk": "ACT#organize-event", "activityId": "organize-event", "name": "Organize an event", "pillar": 1, "points": 20, "evidenceRequired": false, "active": true, "systemDefined": true },
+    { "sk": "ACT#mentor-member", "activityId": "mentor-member", "name": "Mentor a member", "pillar": 1, "points": 15, "evidenceRequired": true, "active": true, "systemDefined": false },
+    { "sk": "ACT#forum-post", "activityId": "forum-post", "name": "Create a forum post", "pillar": 2, "points": 1, "evidenceRequired": false, "active": true, "systemDefined": true },
+    { "sk": "ACT#forum-accepted-reply", "activityId": "forum-accepted-reply", "name": "Accepted reply", "pillar": 2, "points": 2, "evidenceRequired": false, "active": true, "systemDefined": true },
+    { "sk": "ACT#lessons-learned", "activityId": "lessons-learned", "name": "Lessons-learned writeup", "pillar": 2, "points": 10, "evidenceRequired": true, "active": true, "systemDefined": false },
+    { "sk": "ACT#open-source", "activityId": "open-source", "name": "Open-source contribution", "pillar": 3, "points": 15, "evidenceRequired": true, "active": true, "systemDefined": false },
+    { "sk": "ACT#reusable-asset", "activityId": "reusable-asset", "name": "Reusable asset / demo", "pillar": 3, "points": 12, "evidenceRequired": true, "active": true, "systemDefined": false },
+    { "sk": "ACT#blog", "activityId": "blog", "name": "Blog / article", "pillar": 4, "points": 15, "evidenceRequired": true, "active": true, "systemDefined": false },
+    { "sk": "ACT#public-speaking", "activityId": "public-speaking", "name": "Public speaking", "pillar": 4, "points": 20, "evidenceRequired": true, "active": true, "systemDefined": false }
+  ],
+  "eventPoints": [
+    { "sk": "EVTP#Social", "eventType": "Social", "attendancePoints": 3, "deliveryPoints": 6 },
+    { "sk": "EVTP#Meetup", "eventType": "Meetup", "attendancePoints": 5, "deliveryPoints": 10 },
+    { "sk": "EVTP#Webinar", "eventType": "Webinar", "attendancePoints": 8, "deliveryPoints": 16 },
+    { "sk": "EVTP#AMA", "eventType": "AMA", "attendancePoints": 8, "deliveryPoints": 16 },
+    { "sk": "EVTP#Presentation", "eventType": "Presentation", "attendancePoints": 10, "deliveryPoints": 20 },
+    { "sk": "EVTP#Workshop", "eventType": "Workshop", "attendancePoints": 10, "deliveryPoints": 20 },
+    { "sk": "EVTP#Conference", "eventType": "Conference", "attendancePoints": 15, "deliveryPoints": 30 },
+    { "sk": "EVTP#Hackathon", "eventType": "Hackathon", "attendancePoints": 25, "deliveryPoints": 50 }
+  ],
+  "tiers": [
+    { "sk": "TIER#Gold", "tier": "Gold", "minPoints": 75, "recognitionLabel": "Community Star" },
+    { "sk": "TIER#Silver", "tier": "Silver", "minPoints": 50, "recognitionLabel": "Active Contributor" },
+    { "sk": "TIER#Bronze", "tier": "Bronze", "minPoints": 25, "recognitionLabel": "Engaged Member" },
+    { "sk": "TIER#Rising", "tier": "Rising", "minPoints": 0, "recognitionLabel": "Rising Participant" }
+  ]
+}

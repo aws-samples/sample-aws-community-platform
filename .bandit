@@ -1,0 +1,44 @@
+[bandit]
+# Bandit security linter configuration
+# See: https://bandit.readthedocs.io/en/latest/config.html
+
+# B310 (urllib urlopen -- permitted schemes) is NO LONGER GLOBALLY SKIPPED.
+#
+# It used to be `skips = B310` with a comment listing every call site. Two problems
+# with that, both found on 2026-08-30 when a centralised appsec scan reported three
+# B310 findings this config claimed were handled:
+#
+#   1. A global skip is not portable. Centralised scanners deliberately ignore
+#      repo-local suppression files -- you do not let the scanned repo switch the
+#      scanner off -- so the skip silenced B310 locally while the finding still
+#      surfaced upstream. The repo looked clean and was not.
+#
+#   2. A global skip pre-approves code that does not exist yet. Every future
+#      urlopen was exempt before anyone reviewed it, and the hand-maintained list
+#      of call sites in the old comment had already drifted out of date.
+#
+# Replaced with per-call-site `# nosec B310` carrying a specific reason, so each
+# one is a decision on the record. Note that BOTH comment forms are required at a
+# call site: `# noqa: S310` for ruff and `# nosec B310` for bandit. Carrying only
+# the ruff form is exactly why those three findings kept being reported -- the
+# suppression was written for the wrong tool. Same class of mistake as the cfn_nag
+# suppression that named W29 for a finding that fires as F1000.
+#
+# Where a scheme guard is possible it is now enforced in code rather than asserted
+# in a comment (platform/seed/cfn.py, infra/tools/verify_materials_sigv4_deploy.py
+# both reject non-https). The one exception is
+# infra/tools/verify_security_hardening_deploy.py, which varies the scheme between
+# http and https on purpose -- that IS its assertion -- so it carries the
+# suppression and no guard, with the reasoning inline.
+
+# Excluded paths: developer tooling, not production code (matches semgrepignore).
+#
+# `build` covers services/*/build/ as well as platform/build/. Those directories
+# hold VENDORED THIRD-PARTY WHEELS staged by `make build` (botocore, requests, six,
+# typing_extensions...) -- gitignored, not this repo's source. Scanning them
+# produced 56 MEDIUM/HIGH findings that are all upstream code we do not author or
+# patch here (B324 hashlib in botocore, B102 exec_used in six, B307 eval in
+# typing_extensions), which drowned the findings that are actually ours. Upstream
+# dependency risk is a supply-chain concern handled by pinning and grype, not by
+# running a Python linter over other people's packages.
+exclude_dirs = load-testing,build,requirements,tests

@@ -1,0 +1,32 @@
+{
+  "title": "EventNotificationEvents",
+  "description": "Events published for Notifications (Unit 10) to deliver. Division of responsibility (decision D2): the Events service RENDERS the iCalendar body; Notifications owns SES and delivery. Events never calls SES. Until Notifications is real these events accumulate on the bus — the state is correct and only delivery is pending. EventReminderDue was REMOVED on 2026-08-27 along with the event reminder feature; the calendar invite already puts the event in the member's own calendar, which is where a reminder belongs.",
+  "oneOf": [
+    { "$ref": "#/definitions/CalendarInviteDue" },
+    { "$ref": "#/definitions/MaterialsAdded" }
+  ],
+  "definitions": {
+    "CalendarInviteDue": {
+      "type": "object",
+      "description": "Addressed to ONE recipient on RSVP transition (US-2.8). Distinct from EventUpdated, which is a broadcast about the event itself; conflating them would force Notifications to inspect a discriminator to decide who to mail. `icsMethod=CANCEL` removes the entry from the member's calendar when an RSVP flips yes -> no (BR-C4).",
+      "required": ["eventId", "recipientUserId", "icsMethod"],
+      "properties": {
+        "eventId": { "type": "string" },
+        "recipientUserId": { "type": "string" },
+        "icsMethod": { "type": "string", "enum": ["REQUEST", "CANCEL"] },
+        "ics": { "type": "string" }
+      }
+    },
+    "MaterialsAdded": {
+      "type": "object",
+      "description": "A POST-event material was added (BR-M5). Pre-event materials do not notify — they are routine preparation and would spam RSVPs.",
+      "required": ["eventId", "materialId"],
+      "properties": {
+        "eventId": { "type": "string" },
+        "materialId": { "type": "string" },
+        "name": { "type": "string" },
+        "notifyRsvps": { "type": "boolean" }
+      }
+    }
+  }
+}

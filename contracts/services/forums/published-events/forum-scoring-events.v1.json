@@ -1,0 +1,37 @@
+{
+  "title": "ForumScoringEvents",
+  "description": "Forum events consumed by Contributions & Scoring (Unit 7) for auto-award (US-6.4, DL17). AUTHORED AHEAD OF THE PRODUCER (dormant-consumer pattern, DL10): Forums is still a mock, so Unit 7 builds its consumer against this contract now and it stays dormant (0 messages) until Forums is built. A forum channel always belongs to exactly one group (DL7), so `groupId` is always present. `authorRole` is stamped by Forums at action time (DL8) so Unit 7 needs no role projection. Reply points are awarded ONLY when a reply is accepted as the answer (US-4.15) and are REVERSED on un-accept — the toggle carries `accepted`. `postDate` is the ORIGINAL post/reply creation date and sets the scoring quarter (DL17).",
+  "oneOf": [
+    { "$ref": "#/definitions/ForumPostCreated" },
+    { "$ref": "#/definitions/ReplyAccepted" }
+  ],
+  "definitions": {
+    "ForumPostCreated": {
+      "type": "object",
+      "description": "A member created a forum post (+1, single-group, uncapped). earnedDate = postDate.",
+      "required": ["postId", "authorId", "authorRole", "groupId", "postDate"],
+      "properties": {
+        "postId": { "type": "string" },
+        "authorId": { "type": "string" },
+        "authorName": { "type": "string" },
+        "authorRole": { "type": "string", "enum": ["Member", "UserGroupLeader", "CommunityLeader", "Administrator"] },
+        "groupId": { "type": "string", "description": "The channel's group (always present — DL7)" },
+        "postDate": { "type": "string", "description": "ISO date the post was created; sets the quarter" }
+      }
+    },
+    "ReplyAccepted": {
+      "type": "object",
+      "description": "A reply's accepted-answer state changed (US-4.15). `accepted=true` awards +2 to the reply author; `accepted=false` (un-accept / accepted-answer changed away) reverses -2. Both land in the quarter of the reply's ORIGINAL postDate (DL17). The consumer toggles per-reply state so redelivery of either transition is a no-op.",
+      "required": ["replyId", "authorId", "authorRole", "groupId", "postDate", "accepted"],
+      "properties": {
+        "replyId": { "type": "string" },
+        "authorId": { "type": "string" },
+        "authorName": { "type": "string" },
+        "authorRole": { "type": "string", "enum": ["Member", "UserGroupLeader", "CommunityLeader", "Administrator"] },
+        "groupId": { "type": "string" },
+        "postDate": { "type": "string", "description": "ISO date the REPLY was originally posted; sets the quarter" },
+        "accepted": { "type": "boolean", "description": "true = accepted (award +2); false = un-accepted (reverse -2)" }
+      }
+    }
+  }
+}

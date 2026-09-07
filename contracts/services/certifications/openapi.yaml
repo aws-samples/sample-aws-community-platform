@@ -1,0 +1,360 @@
+openapi: 3.0.3
+# Certifications Service API — v2.0.0 (Unit 6 Code Generation, 2026-08-06).
+# BREAKING (design decision D9, user-approved): revoke is claim-addressed —
+# `POST /certifications/claims/{id}/revoke` replaces `POST /certifications/{id}/revoke`
+# (the old op's `memberId` was optional, making a meaningless request valid; the
+# shipped UI's revoke was already wrong and is rebuilt this unit).
+# Everything else is additive: full definition/claim field sets, the Withdrawn
+# status, evidence upload grants, queue filters/countOnly, and the claims
+# collection route that member-profiles' deployed fan-out ALREADY CALLS
+# (?memberId=&countOnly=true, ?certId=&status=Approved, from/to + decidedAt).
+# Wire status vocabulary (D1): Pending | Approved | Rejected | Withdrawn |
+# Revoked | Expired. The UI renders Approved as "Verified" (mockup wording).
+# NOTE: path ORDER matters for the generated mock's first-match routing —
+# literal segments (/certifications/claims/me, /certifications/claims,
+# /certifications/verifications, /certifications/evidence-uploads,
+# /certifications/badge-uploads) must stay ahead of /certifications/{id}.
+info: { title: Certifications API, version: 2.0.0 }
+paths:
+  /certifications/claims/me:
+    get:
+      operationId: myClaims
+      x-mock-collection: claims
+      description: Owner projection (US-5.5) — full statuses, reasons, evidence refs.
+      responses: { '200': { description: My claims, content: { application/json: { schema: { $ref: '#/components/schemas/ClaimList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /certifications/claims/{id}/decision:
+    post:
+      operationId: decideClaim
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [decision], properties: { decision: { type: string, enum: [approve, reject] }, reason: { type: string, maxLength: 500, description: Required when decision=reject (enforced in-service, BR-V4). } } } } } }
+      responses: { '200': { description: Decided, content: { application/json: { schema: { $ref: '#/components/schemas/Claim' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+  /certifications/claims/{id}/revoke:
+    post:
+      operationId: revokeClaim
+      description: >-
+        Claim-addressed revoke (US-5.8, D9). Target must be Approved; points are NOT reversed.
+        A Community Leader may revoke any claim; a User Group Leader (change request 2026-08-07)
+        may revoke only claims credited to the group they lead (404 outside it) and never their
+        own certification (403).
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string, maxLength: 500 } } } } } }
+      responses: { '200': { description: Revoked, content: { application/json: { schema: { $ref: '#/components/schemas/Claim' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+  /certifications/claims/{id}/evidence-url:
+    get:
+      operationId: evidenceUrl
+      description: Fresh short-lived presigned GET for file evidence (BR-P2). Owner or in-scope reviewer only; 409 while the file is PendingScan/Quarantined. URLs are minted per request and never stored.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: URL, content: { application/json: { schema: { type: object, required: [url], properties: { url: { type: string }, expiresInSeconds: { type: integer } } } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+  /certifications/claims/{id}:
+    delete:
+      operationId: withdrawClaim
+      description: Owner-only, Pending-only (US-5.5). Soft transition to Withdrawn — history retained, resubmission allowed.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: Withdrawn }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' }, '501': { $ref: '#/components/responses/NI' } }
+  /certifications/claims:
+    get:
+      operationId: listClaims
+      x-mock-collection: claims
+      description: >-
+        Claims collection read. PRIVACY RULE (BR-P1): to anyone but the claim owner this
+        serves only the Approved (public-badge) projection — other statuses, evidence,
+        notes and reasons are owner-only. This is the route member-profiles' deployed
+        fan-out already calls (activity counts, badges, directory cert filter).
+      parameters:
+        - { name: memberId, in: query, schema: { type: string } }
+        - { name: certId, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [Pending, Approved, Rejected, Withdrawn, Revoked, Expired] } }
+        - { name: from, in: query, schema: { type: string, description: ISO date lower bound on decidedAt } }
+        - { name: to, in: query, schema: { type: string, description: ISO date upper bound on decidedAt } }
+        - { name: countOnly, in: query, schema: { type: boolean } }
+      responses: { '200': { description: Claims, content: { application/json: { schema: { $ref: '#/components/schemas/ClaimList' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+    post:
+      operationId: submitClaim
+      x-mock-collection: claims
+      description: >-
+        Members and User Group Leaders (US-5.4; UGL added by change request 2026-08-07).
+        A Member credits a group they BELONG to; a UGL credits the group they LEAD (the
+        creditedGroupId sent is that led group). Server validates: certification active
+        (409 if not claimable), no live duplicate across all groups (409), dateEarned
+        required when the certification expires and not in the future, already-expired
+        blocked (422), evidence exactly one of evidenceUrl XOR evidenceFileKey. A UGL's
+        approved claim earns ZERO points (Q3=B) but shows the badge; a UGL can never
+        decide their own claim (only a CL can).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [certId, creditedGroupId, dateEarned]
+              properties:
+                certId: { type: string }
+                creditedGroupId: { type: string, description: For a Member, a group they belong to. For a UGL, the group they lead (the server resolves and enforces the led group regardless). }
+                evidenceUrl: { type: string, description: http(s) link evidence (XOR evidenceFileKey) }
+                evidenceFileKey: { type: string, description: fileKey from grantEvidenceUpload (XOR evidenceUrl) }
+                evidenceFileName: { type: string, description: original filename, display only }
+                notes: { type: string, maxLength: 1000 }
+                dateEarned: { type: string, description: "ISO date; REQUIRED for every claim (BR-C5′, Certification Ledger enh. 2026-08-12) — the certificate's real date, used as the ledger's Certification Date and the charts' earned-quarter bucket; not in the future." }
+      responses: { '201': { description: Submitted, content: { application/json: { schema: { $ref: '#/components/schemas/Claim' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '409': { $ref: '#/components/responses/Conflict' }, '422': { $ref: '#/components/responses/Unprocessable' }, '501': { $ref: '#/components/responses/NI' } }
+  /certifications/verifications:
+    get:
+      operationId: verificationQueue
+      x-mock-collection: claims
+      description: >-
+        Pending queue (US-5.7), oldest-first by submittedAt. CL sees all groups; UGL only
+        claims credited to their led group; Administrators 403 (D7). countOnly=true powers
+        the nav pending-count badge (computed on the fly — Option 2A, never stored).
+      parameters:
+        - { name: certId, in: query, schema: { type: string } }
+        - { name: groupId, in: query, schema: { type: string, description: CL-only filter } }
+        - { name: countOnly, in: query, schema: { type: boolean } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 25, description: Page size (thousands-pending at CL scale — cursor pagination, mirrors /users). Ignored when countOnly=true. } }
+        - { name: cursor, in: query, schema: { type: string, description: Opaque forward-only pagination cursor from a prior page's response. } }
+      responses: { '200': { description: Pending claims (paged), content: { application/json: { schema: { $ref: '#/components/schemas/ClaimList' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /certifications/evidence-uploads:
+    post:
+      operationId: grantEvidenceUpload
+      description: >-
+        Member-only. Returns a short-lived presigned POST to the scanned upload bucket
+        under a SYSTEM-GENERATED unique key (BR-C7) — the policy enforces the 5 MB cap
+        and exact content type at the storage door (N2/J1). pdf/png/jpg/jpeg only.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [fileName], properties: { fileName: { type: string }, contentType: { type: string } } } } } }
+      responses: { '200': { description: Upload grant, content: { application/json: { schema: { $ref: '#/components/schemas/UploadGrant' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /certifications/badge-uploads:
+    post:
+      operationId: grantBadgeUpload
+      description: CL-only badge-image upload grant (US-5.1, D6). Same door rules; png/jpg/jpeg only (no SVG — script risk). Image is served publicly only after a Clean scan verdict (copied to the SPA bucket, N3=B).
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [fileName], properties: { fileName: { type: string }, contentType: { type: string } } } } } }
+      responses: { '200': { description: Upload grant, content: { application/json: { schema: { $ref: '#/components/schemas/UploadGrant' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /certifications/ledger:
+    get:
+      operationId: listLedger
+      x-mock-collection: certLedger
+      description: >-
+        Certification Ledger (Unit 6 enhancement, 2026-08-12). Member-wise list of granted
+        certifications (Approved/Expired/Revoked) for one EARNED quarter, cursor-paginated,
+        newest-earned-first. CL sees all groups (optional groupId filter); a UGL is locked to
+        the group they lead (client groupId ignored). Members/Administrators 403. Never exposes
+        the approver (BR-L7). "Certification Date" = earned date (fallback approval date).
+      parameters:
+        - { name: quarter, in: query, schema: { type: string, description: "YYYY-Qn; defaults to the current quarter." } }
+        - { name: groupId, in: query, schema: { type: string, description: CL-only filter; ignored/forced-to-led-group for a UGL. } }
+        - { name: certId, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, description: "CSV/repeat of Active|Expired|Revoked (Active = Approved). Default = all three." } }
+        - { name: memberId, in: query, schema: { type: string } }
+        - { name: memberName, in: query, schema: { type: string, description: "Free-text member name, matched case-insensitively as a substring against the name denormalised on the claim. Name only — email is not denormalised onto claims. ANDs with memberId if both are given." } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 25 } }
+        - { name: cursor, in: query, schema: { type: string, description: Opaque forward-only pagination cursor. } }
+      responses: { '200': { description: Ledger page, content: { application/json: { schema: { $ref: '#/components/schemas/LedgerList' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /certifications/stats/growth:
+    get:
+      operationId: statsGrowth
+      x-mock-collection: certGrowth
+      description: >-
+        Quarterly Certification Growth (last N quarters). Two series per quarter — `new`
+        (certifications earned that quarter, permanent) and `total` (valid holdings as of
+        quarter-end; expiry/revoke decrement it). Served from maintained rollup counters, not
+        a claim scan. CL community-wide (optional groupId); UGL locked to led group.
+      parameters:
+        - { name: quarters, in: query, schema: { type: integer, minimum: 1, maximum: 12, default: 4 } }
+        - { name: groupId, in: query, schema: { type: string, description: CL-only; absent = community-wide. } }
+      responses: { '200': { description: Growth series (oldest→newest), content: { application/json: { schema: { $ref: '#/components/schemas/GrowthResponse' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /certifications/stats/snapshot:
+    get:
+      operationId: statsSnapshot
+      x-mock-collection: certSnapshot
+      description: >-
+        Certification Snapshot — certifications held (valid) as of the selected quarter,
+        grouped by certification name (bar chart), count-descending. Served from rollup
+        counters. CL community-wide (optional groupId); UGL locked to led group.
+      parameters:
+        - { name: quarter, in: query, schema: { type: string, description: "YYYY-Qn; defaults to the current quarter." } }
+        - { name: groupId, in: query, schema: { type: string, description: CL-only; absent = community-wide. } }
+      responses: { '200': { description: Per-certification counts, content: { application/json: { schema: { $ref: '#/components/schemas/SnapshotResponse' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /certifications:
+    get:
+      operationId: browseCatalog
+      description: >-
+        Catalog (US-5.10). Active definitions with per-caller enrichment (held /
+        heldExpiresAt / pendingClaim). Leaders pass includeInactive=true for the
+        Definitions tab. Administrators 403 (D7 — blanket, matrix row removed).
+      parameters:
+        - { name: includeInactive, in: query, schema: { type: boolean } }
+      responses: { '200': { description: Catalog, content: { application/json: { schema: { $ref: '#/components/schemas/CertList' } } } }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+    post:
+      operationId: createCert
+      description: CL-only (US-5.1). Published immediately (active=true).
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CertificationInput' } } } }
+      responses: { '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Certification' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '501': { $ref: '#/components/responses/NI' } }
+  /certifications/{id}:
+    put:
+      operationId: editCert
+      description: >-
+        CL-only (US-5.2/5.3). Edits never touch already-approved claims (points/expiry
+        were frozen at approval); name/image changes DO flow into badge display.
+        active=false deactivates (hidden from catalog/submission; holders keep badges;
+        pending claims remain decidable); active=true reactivates.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CertificationUpdate' } } } }
+      responses: { '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Certification' } } } }, '400': { $ref: '#/components/responses/BadRequest' }, '403': { $ref: '#/components/responses/Forbidden' }, '404': { $ref: '#/components/responses/NotFound' }, '501': { $ref: '#/components/responses/NI' } }
+components:
+  responses:
+    BadRequest: { description: Bad request, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Forbidden: { description: Forbidden, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: Not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Conflict: { description: Conflict, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Unprocessable: { description: Unprocessable, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NI: { description: Not yet implemented, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  schemas:
+    Certification:
+      type: object
+      required: [id, name, description, category, points, active]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        category: { type: string, enum: [AWS Certification, Community Badge] }
+        points: { type: integer, minimum: 0, description: Per-certification value credited on approval (US-5.1/US-6.5); frozen onto the claim at approval. }
+        expiryPeriodMonths: { type: integer, minimum: 1, description: Absent = never expires. }
+        badgeImageUrl: { type: string, description: Public CloudFront URL (N3=B); absent until a Clean scan verdict. }
+        badgeImageStatus: { type: string, enum: [None, PendingScan, Clean, Quarantined] }
+        active: { type: boolean }
+        held: { type: boolean, description: Per-caller — the caller has an Approved claim for this certification. }
+        heldExpiresAt: { type: string, description: Per-caller — the held claim's expiry date, when set. }
+        pendingClaim: { type: boolean, description: Per-caller — the caller has a Pending claim for this certification. }
+        createdAt: { type: string }
+        updatedAt: { type: string }
+    CertificationInput:
+      type: object
+      required: [name, description, category, points]
+      properties:
+        name: { type: string, maxLength: 120 }
+        description: { type: string, maxLength: 2000 }
+        category: { type: string, enum: [AWS Certification, Community Badge] }
+        points: { type: integer, minimum: 0 }
+        expiryPeriodMonths: { type: integer, minimum: 1 }
+        badgeImageKey: { type: string, description: fileKey from grantBadgeUpload. }
+        badgeImageFileName: { type: string }
+    CertificationUpdate:
+      type: object
+      properties:
+        name: { type: string, maxLength: 120 }
+        description: { type: string, maxLength: 2000 }
+        category: { type: string, enum: [AWS Certification, Community Badge] }
+        points: { type: integer, minimum: 0 }
+        expiryPeriodMonths: { type: integer, minimum: 1, nullable: true, description: null clears the expiry period. }
+        badgeImageKey: { type: string }
+        badgeImageFileName: { type: string }
+        active: { type: boolean }
+    Claim:
+      type: object
+      required: [id, certId, memberId, creditedGroupId, status, submittedAt]
+      properties:
+        id: { type: string }
+        certId: { type: string }
+        certName: { type: string, description: Denormalised for display (joined from the definition at read time). }
+        certCategory: { type: string }
+        badgeImageUrl: { type: string }
+        memberId: { type: string }
+        memberName: { type: string, description: Denormalised from JWT claims at submission — queue/list rows render without per-row identity lookups. }
+        creditedGroupId: { type: string }
+        creditedGroupName: { type: string, description: Denormalised at submission. }
+        status: { type: string, enum: [Pending, Approved, Rejected, Withdrawn, Revoked, Expired], description: Wire value "Approved" is rendered as "Verified" in the UI (D1). }
+        evidenceUrl: { type: string }
+        evidenceFileName: { type: string, description: Original filename, display only; the object key is system-generated (BR-C7). }
+        hasEvidenceFile: { type: boolean }
+        scanStatus: { type: string, enum: [None, PendingScan, Clean, Quarantined] }
+        notes: { type: string }
+        dateEarned: { type: string }
+        submittedAt: { type: string }
+        decidedAt: { type: string }
+        rejectReason: { type: string, description: Owner-visible; absent on Withdrawn by design (US-5.5). }
+        pointsAwarded: { type: integer, description: Frozen at approval (BR-V6). }
+        expiresAt: { type: string, description: Frozen at approval (D8). }
+        revokedAt: { type: string }
+        revokeReason: { type: string }
+        own: { type: boolean, description: Verification-queue rows only — true when the claim belongs to the caller (a UGL may claim; their own claim is visible but only a CL may decide it, change request Q2=B). }
+    ClaimList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Claim' } }
+        count: { type: integer }
+        cursor: { type: string, description: Present when more pages exist (verification queue) — pass it back as the cursor query param for the next page. }
+    CertList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Certification' } }
+        count: { type: integer }
+    LedgerRow:
+      type: object
+      description: A granted-certification ledger row. No approver field is ever exposed (BR-L7).
+      required: [id, certId, memberId, creditedGroupId, status]
+      properties:
+        id: { type: string }
+        certId: { type: string }
+        certName: { type: string }
+        certCategory: { type: string }
+        memberId: { type: string }
+        memberName: { type: string }
+        creditedGroupId: { type: string }
+        creditedGroupName: { type: string }
+        status: { type: string, enum: [Approved, Expired, Revoked], description: Wire "Approved" is rendered "Verified"/"Active" in the UI. }
+        certificationDate: { type: string, description: Earned date (fallback approval date) — the ledger's Certification Date. }
+        dateEarned: { type: string }
+        decidedAt: { type: string }
+        expiresAt: { type: string }
+        revokedAt: { type: string }
+    LedgerList:
+      type: object
+      required: [items, count]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/LedgerRow' } }
+        count: { type: integer }
+        quarter: { type: string }
+        cursor: { type: string, description: Present when more pages exist — pass back as the cursor query param. }
+    GrowthResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [quarter, new, total]
+            properties:
+              quarter: { type: string }
+              new: { type: integer, description: Certifications earned that quarter (permanent). }
+              total: { type: integer, description: Valid holdings as of quarter-end. }
+        scope: { type: string, description: "COMMUNITY or GROUP#<id>." }
+    SnapshotResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [certId, certName, count]
+            properties:
+              certId: { type: string }
+              certName: { type: string }
+              count: { type: integer, description: Held (valid) as of the quarter. }
+        quarter: { type: string }
+        scope: { type: string }
+    UploadGrant:
+      type: object
+      required: [fileKey, uploadUrl, fields]
+      properties:
+        fileKey: { type: string, description: System-generated unique object key (BR-C7); reference it in submitClaim/createCert. }
+        uploadUrl: { type: string, description: Presigned POST URL. }
+        fields: { type: object, additionalProperties: { type: string }, description: Presigned POST form fields — policy enforces the 5 MB cap and exact content type (N2/J1). }
+        expiresInSeconds: { type: integer }
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        correlationId: { type: string }

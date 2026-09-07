@@ -1,0 +1,17 @@
+{
+  "title": "EventCompletedEvent",
+  "description": "Published by the Events service when an event is marked complete (attendance applied or manual completion). Added 2026-08-07 for Unit 7's staged fan-out (DL4): instead of one AttendanceRecorded per attendee, Events emits ONE lightweight EventCompleted; Contributions & Scoring reads the event + earner lists back from Events (GET /events/{eventId}) and fans out per-earner internally, so the user's 'mark complete' click never waits on point-awarding (DL3). Each earner entry carries the earner's ROLE stamped at completion time (DL8) so Contributions needs no role projection. `groupId` null = community-wide (Contributions splits equally across the earner's groups). Bundled in the Unit 7 coordinated redeploy; supersedes per-attendee award publication.",
+  "oneOf": [ { "$ref": "#/definitions/EventCompleted" } ],
+  "definitions": {
+    "EventCompleted": {
+      "type": "object",
+      "required": ["eventId", "eventType", "eventDate"],
+      "properties": {
+        "eventId": { "type": "string" },
+        "eventType": { "type": "string", "enum": ["Meetup", "Workshop", "Hackathon", "Webinar", "AMA", "Conference", "Presentation", "Social"] },
+        "eventDate": { "type": "string", "description": "ISO date the event occurred; sets the scoring quarter (DL11)" },
+        "groupId": { "type": ["string", "null"], "description": "The event's group, or null for community-wide (Contributions applies the equal-distribution split)" }
+      }
+    }
+  }
+}

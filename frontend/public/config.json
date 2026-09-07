@@ -1,0 +1,5 @@
+{
+  "apiEndpoint": "/api",
+  "userPoolId": "local-dev",
+  "userPoolClientId": "local-dev"
+}

@@ -1,0 +1,89 @@
+{
+  "title": "CertificationLifecycleEvents",
+  "description": "Certifications service domain events (v1), carried in the platform event envelope 'data' field. Published AFTER the primary write commits (a publish failure never fails a committed write); consumers must be idempotent on the envelope id. Five event types (design decision D10, user-approved): the three reserved in contracts/README plus CertificationRejected and CertificationExpiringSoon, so the future Notifications unit finds every US-8.15 certification trigger already flowing without this service being reopened. Points are NEVER reversed by Revoked/Expired — the `pointsReversed: false` constant makes that contract explicit for Contributions (US-5.8/US-5.1).",
+  "oneOf": [
+    { "$ref": "#/definitions/CertificationApproved" },
+    { "$ref": "#/definitions/CertificationRejected" },
+    { "$ref": "#/definitions/CertificationRevoked" },
+    { "$ref": "#/definitions/CertificationExpiringSoon" },
+    { "$ref": "#/definitions/CertificationExpired" }
+  ],
+  "definitions": {
+    "CertificationApproved": {
+      "type": "object",
+      "description": "A leader approved a claim. Consumed by Contributions & Scoring (Unit 7) for auto-award (US-6.5): `points` is the per-certification value frozen onto the claim at approval (BR-V6), credited to `groupId` (the group the member chose at submission, US-5.4). `idempotencyKey` is identity-derived so a consumer retry cannot double-award (Events precedent).",
+      "required": ["idempotencyKey", "claimId", "certId", "memberId", "groupId", "points"],
+      "properties": {
+        "idempotencyKey": { "type": "string", "description": "<certId>#<memberId>#approved" },
+        "claimId": { "type": "string" },
+        "certId": { "type": "string" },
+        "certName": { "type": "string" },
+        "memberId": { "type": "string" },
+        "memberName": { "type": ["string", "null"], "description": "Denormalised member name so Contributions writes it onto the point-ledger row directly, instead of relying on its member projection (which may be unpopulated for older members)." },
+        "groupId": { "type": "string", "description": "Credited group (US-5.4)" },
+        "points": { "type": "integer", "minimum": 0 },
+        "submittedAt": { "type": ["string", "null"], "description": "Claim submission timestamp — added 2026-08-07 (Unit 7 DL13) so Contributions attributes cert points to the SUBMISSION quarter (US-6.12). Additive; bundled in the Unit 7 coordinated redeploy." },
+        "dateEarned": { "type": ["string", "null"], "description": "Member-supplied earn date (D8), when provided" },
+        "expiresAt": { "type": ["string", "null"], "description": "Frozen at approval; null = never expires" },
+        "decidedAt": { "type": "string" },
+        "decidedBy": { "type": "string" }
+      }
+    },
+    "CertificationRejected": {
+      "type": "object",
+      "description": "A claim was rejected — by a leader with a reason (US-5.6), or by the system when the member left/was removed from the credited group before verification (US-5.4, `system: true`, reason 'No longer a member of the credited group'). Notification trigger only; no points implications.",
+      "required": ["claimId", "certId", "memberId", "groupId", "reason", "system"],
+      "properties": {
+        "claimId": { "type": "string" },
+        "certId": { "type": "string" },
+        "certName": { "type": "string" },
+        "memberId": { "type": "string" },
+        "groupId": { "type": "string" },
+        "reason": { "type": "string" },
+        "system": { "type": "boolean" },
+        "decidedAt": { "type": "string" }
+      }
+    },
+    "CertificationRevoked": {
+      "type": "object",
+      "description": "A Community Leader revoked an earned certification (US-5.8). The badge is removed; the member is notified with the reason; points are retained.",
+      "required": ["claimId", "certId", "memberId", "groupId", "reason", "pointsReversed"],
+      "properties": {
+        "claimId": { "type": "string" },
+        "certId": { "type": "string" },
+        "certName": { "type": "string" },
+        "memberId": { "type": "string" },
+        "groupId": { "type": "string" },
+        "reason": { "type": "string" },
+        "pointsReversed": { "type": "boolean", "const": false },
+        "revokedAt": { "type": "string" },
+        "revokedBy": { "type": "string" }
+      }
+    },
+    "CertificationExpiringSoon": {
+      "type": "object",
+      "description": "T-14-day expiry notice (US-5.1), emitted exactly once per holding by the daily sweep (mark-before-emit, BR-X2 — the failure direction is a lost notice, never a duplicate).",
+      "required": ["claimId", "certId", "memberId", "expiresAt"],
+      "properties": {
+        "claimId": { "type": "string" },
+        "certId": { "type": "string" },
+        "certName": { "type": "string" },
+        "memberId": { "type": "string" },
+        "expiresAt": { "type": "string" }
+      }
+    },
+    "CertificationExpired": {
+      "type": "object",
+      "description": "The daily sweep expired a holding at its frozen expiresAt (US-5.1). Badge removed immediately; points retained; resubmission allowed (the duplicate check treats Expired like Rejected).",
+      "required": ["claimId", "certId", "memberId", "expiredAt", "pointsReversed"],
+      "properties": {
+        "claimId": { "type": "string" },
+        "certId": { "type": "string" },
+        "certName": { "type": "string" },
+        "memberId": { "type": "string" },
+        "expiredAt": { "type": "string" },
+        "pointsReversed": { "type": "boolean", "const": false }
+      }
+    }
+  }
+}

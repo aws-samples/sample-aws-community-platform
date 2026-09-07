@@ -1,0 +1,462 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  App stack for certifications (REAL Lambda + routes + role + rules + schedules
+  + alarms). One function serves three inputs (Unit 6 NFR Design/J4):
+  authenticated HTTP, events (Identity MembershipChanged + GuardDuty scan
+  verdicts, both prefix-scoped), and two schedules (daily expiry sweep,
+  15-minute scan watchdog).
+Parameters:
+  Stage: { Type: String, Default: dev }
+  RestApiId: { Type: String }
+  # The private twin of RestApiId. Same route table, reachable only from
+  # inside the VPC through the execute-api interface endpoint.
+  PrivateRestApiId: { Type: String }
+  RootResourceId: { Type: String }
+  EventBusName: { Type: String }
+  EventBusArn: { Type: String, Default: '' }
+  TableName: { Type: String }
+  IdempotencyTableName: { Type: String }
+  FileShareBucketName: { Type: String, Default: '' }
+  FileShareBucketArn: { Type: String, Default: '' }
+  SpaBucketName: { Type: String, Default: '' }
+  ApiBaseUrl: { Type: String, Default: '' }
+  EnableSemanticSearch: { Type: String, Default: 'false' }
+  OpsAlarmTopicArn: { Type: String }
+  PrivateSubnetIds: { Type: CommaDelimitedList }
+  LambdaSecurityGroupId: { Type: String }
+  # CMK from the foundation stack for the log group(s) below. Required (no
+  # Default): an empty string is not a valid KmsKeyId, so a missing value must
+  # fail at deploy time rather than silently produce an unencrypted log group.
+  LogsKmsKeyArn: { Type: String }
+  # Managed policy from foundation granting DynamoDB-mediated use of the table
+  # CMK. Required (no Default): without it every DynamoDB call from these
+  # functions fails with a KMS AccessDenied once the key policy's wildcard
+  # statement is removed.
+  DynamoDbKmsAccessPolicyArn: { Type: String }
+
+Globals:
+  Function:
+    # 256/15 retained deliberately (tech-stack decision): no 100+-item batch
+    # writes or 1000-row imports here — Events' 512/60 uplift does not apply.
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 15
+    Tracing: Active
+Conditions:
+  HasBusArn: !Not [ !Equals [ !Ref EventBusArn, '' ] ]
+  # Keyed on the Arn (not the Name) so cfn-lint's condition-aware resolution
+  # can prove the Ref/Sub below never sees the empty default.
+  HasBucket: !Not [ !Equals [ !Ref FileShareBucketArn, '' ] ]
+  HasSpaBucket: !Not [ !Equals [ !Ref SpaBucketName, '' ] ]
+Resources:
+  Fn:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "False positive — cfn_nag's SAM transform (cfn-model) drops VpcConfig; this function IS VPC-configured (see VpcConfig below)"
+    Properties:
+      FunctionName: !Sub "certifications-${Stage}"
+      Handler: app.handler            # REAL handler (replaces mock_handler.handler)
+      CodeUri: ../../services/certifications/src/
+      VpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [ !Ref LambdaSecurityGroupId ]
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTableName
+          EVENT_BUS_NAME: !Ref EventBusName
+          FILE_SHARE_BUCKET: !Ref FileShareBucketName
+          SPA_BUCKET: !Ref SpaBucketName
+          API_BASE_URL: !Ref ApiBaseUrl
+          STAGE: !Ref Stage
+          ENABLE_SEMANTIC_SEARCH: !Ref EnableSemanticSearch
+      Policies:
+        # DynamoDB CMK use (see foundation DynamoDbKmsAccessPolicy).
+        - !Ref DynamoDbKmsAccessPolicyArn
+        - Statement:
+            - Sid: OwnTables
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/*"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IdempotencyTableName}"
+        - Statement:
+            - Sid: PublishDomainEvents
+              Effect: Allow
+              Action: events:PutEvents
+              Resource: !If [ HasBusArn, !Ref EventBusArn, !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EventBusName}" ]
+        - !If
+          - HasBucket
+          - Statement:
+              # PREFIX-SCOPED on the shared bucket (finding F3 rationale
+              # verbatim): Settings holds DeleteObject on /*, Events on events/*;
+              # certifications gets certifications/* and can reach nothing else.
+              # Condition-gated: entire policy block omitted when FileShareBucketArn
+              # is not provided — no wildcard Resource fallback (SECURITY-06).
+              - Sid: CertificationFilesObjects
+                # DeleteObjectVersion is a SEPARATE action from DeleteObject and
+                # is required by the malware-quarantine purge. FileShareBucket is
+                # versioned, so DeleteObject alone only writes a delete marker
+                # and leaves the infected object as a readable noncurrent
+                # version; deleting a specific VersionId needs this action, and
+                # without it the purge fails AccessDenied — silently, because it
+                # is best-effort by design. Still prefix-scoped, so this cannot
+                # destroy version history outside certifications/.
+                Effect: Allow
+                Action: [ s3:PutObject, s3:GetObject, s3:DeleteObject, s3:DeleteObjectVersion ]
+                Resource: !Sub "${FileShareBucketArn}/certifications/*"
+              - Sid: CertificationFilesList
+                # ListBucketVersions is likewise distinct from ListBucket and is
+                # what list_object_versions authorises against. Both are
+                # BUCKET-level actions (hence the bare bucket ARN), which is why
+                # the prefix condition is what keeps the scope narrow.
+                Effect: Allow
+                Action: [ s3:ListBucket, s3:ListBucketVersions ]
+                Resource: !Ref FileShareBucketArn
+                Condition:
+                  StringLike:
+                    s3:prefix: [ "certifications/*" ]
+          - !Ref AWS::NoValue
+        - !If
+          - HasSpaBucket
+          - Statement:
+              # The unit's single cross-stack write (N3=B): copy scan-Clean badge
+              # images into the SPA bucket's badges/ prefix — and ONLY there.
+              # GetObject is NOT granted on the SPA bucket; CloudFront's OAI reads it.
+              # Condition-gated: entire policy block omitted when SpaBucketName
+              # is not provided — no wildcard Resource fallback (SECURITY-06).
+              - Sid: BadgePublish
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${SpaBucketName}/badges/*"
+          - !Ref AWS::NoValue
+        - Statement:
+            # Membership read at submission + led-group fallback (D3/D4) —
+            # the caller's own JWT is forwarded, so this is the narrowest
+            # execute-api grant in the portal so far: two GET path families.
+            - Sid: IdentityReadInvoke
+              Effect: Allow
+              Action: execute-api:Invoke
+              Resource:
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/GET/groups"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/GET/groups"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/GET/users/*"
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/GET/users/*"
+        - Statement:
+            - Sid: EmitMetrics
+              Effect: Allow
+              Action: cloudwatch:PutMetricData
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: !Sub "CommunityPortal/certifications-${Stage}"
+
+  # ---- branch 2a: Identity membership events (BR-S1, auto-reject) -----------
+  MembershipRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "certifications-membership-${Stage}"
+      EventBusName: !Ref EventBusName
+      EventPattern:
+        source: [ identity-access ]
+        detail-type: [ MemberLeftGroup, MemberRemoved ]
+      State: ENABLED
+      Targets:
+        - Id: certifications
+          Arn: !GetAtt Fn.Arn
+  MembershipRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MembershipRule.Arn
+
+  # ---- branch 2b: GuardDuty scan verdicts, PREFIX-FILTERED (finding F-B) ----
+  # The MalwareProtectionPlan covers the whole shared bucket, so verdict events
+  # exist for Settings' and Events' objects too. Without this objectKey filter
+  # each scan-gating consumer would receive (and burn an idempotency record on)
+  # every other service's verdicts — the F3 lesson applied to scan results.
+  # Events' rule carries the mirror-image `events/` filter.
+  MalwareScanRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "certifications-malware-scan-${Stage}"
+      EventPattern:
+        source: [ aws.guardduty ]
+        detail-type:
+          - GuardDuty Malware Protection Object Scan Result
+        detail:
+          s3ObjectDetails:
+            objectKey:
+              - prefix: "certifications/"
+      State: ENABLED
+      Targets:
+        - Id: certifications
+          Arn: !GetAtt Fn.Arn
+  MalwareScanRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MalwareScanRule.Arn
+
+  # ---- branch 3: schedules (J4) ---------------------------------------------
+  # Two schedules, one Lambda, one role. Daily is enough for expiry (US-5.1 —
+  # dates, not times); the watchdog runs at 15 min because it powers a 30-min
+  # alarm (N4) and a stuck scan emits nothing by itself.
+  ScheduleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      ManagedPolicyArns:
+        - !Ref ScheduleInvokePolicy
+
+  # Customer-managed rather than an inline `Policies` list on the role above:
+  # cfn-guard IAM_NO_INLINE_POLICY_CHECK (and AWS Config iam-no-inline-policy-check)
+  # reject inline policies on IAM roles however narrow they are, and this one is a
+  # single action on a single function ARN. Permissions are unchanged.
+  #
+  # Attached via the role's ManagedPolicyArns rather than this policy's `Roles`
+  # list so the attachment is part of the role's own creation: ScanWatchdogSchedule
+  # below takes !GetAtt ScheduleRole.Arn, and a `Roles` list would let that
+  # schedule be created against a role not yet permitted to invoke the function.
+  ScheduleInvokePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      # ManagedPolicyName deliberately NOT set — an explicit name triggers cfn_nag
+      # W28 and Ref already returns the ARN.
+      Description: Invoke the certifications function from EventBridge Scheduler.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !GetAtt Fn.Arn
+
+  # ExpirySweepSchedule REMOVED (2026-08-27). The expiry sweep now runs once, as
+  # part of the scheduled-jobs state machine (settings-scheduled-jobs-${Stage}),
+  # rather than additionally on its own cron(0 6).
+  #
+  # ScanWatchdogSchedule below is deliberately KEPT. It is a 15-minute watchdog
+  # that converges uploads stuck awaiting a malware verdict; reducing it to one
+  # nightly pass would leave a stuck scan unresolved for up to a day, which is the
+  # exact condition it exists to prevent. It is still in the batch too — the
+  # reconcile is idempotent, so an extra pass costs nothing.
+  ScanWatchdogSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "certifications-scan-watchdog-${Stage}"
+      ScheduleExpression: rate(15 minutes)
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      State: ENABLED
+      Target:
+        Arn: !GetAtt Fn.Arn
+        RoleArn: !GetAtt ScheduleRole.Arn
+        Input: '{"source":"aws.scheduler","job":"scanwatch"}'
+
+  # ---- alarms (NFR-CT-REL-5 / SEC-8) ----------------------------------------
+  # Every custom metric below has a shipped emitter in providers.Metrics /
+  # expiry_service — an alarm on a metric nobody emits reads as coverage while
+  # providing none (the Events lesson).
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [ { Name: FunctionName, Value: !Ref Fn } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  ThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [ { Name: FunctionName, Value: !Ref Fn } ]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  SweepMissedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        No SweepRunOutcome datapoint in 26h — the daily expiry job silently did
+        not run. Badges stop expiring and T-14 notices stop going out while the
+        API looks perfectly healthy, which is exactly why this alarms on the
+        ABSENCE of a metric (TreatMissingData: breaching).
+      Namespace: !Sub "CommunityPortal/certifications-${Stage}"
+      MetricName: SweepRunOutcome
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  PendingScanAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        A claim's evidence has sat in PendingScan for over 30 minutes (N4) —
+        the GuardDuty verdict pipeline is stalled. Members see "awaiting scan"
+        forever and blame the leaders; nothing else surfaces this.
+      Namespace: !Sub "CommunityPortal/certifications-${Stage}"
+      MetricName: PendingScanAgeMinutes
+      Statistic: Maximum
+      Period: 900
+      EvaluationPeriods: 2
+      Threshold: 30
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  EventPublishFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        Committed writes whose domain events failed to publish — approvals
+        whose points will never auto-award (US-6.5) unless replayed. The write
+        path stays healthy by design (post-commit best-effort), so only this
+        alarm sees it.
+      Namespace: !Sub "CommunityPortal/certifications-${Stage}"
+      MetricName: EventPublishFailure
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  ApiErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Elevated 5xx from the certifications routes.
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - { Name: ApiName, Value: !Sub "community-portal-${Stage}" }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiId}/*/*"
+  # Second permission, for the PRIVATE API. SourceArn pins a permission to a
+  # single api id, so the public one above does NOT cover requests arriving
+  # through the private API — without this they fail with API Gateway unable to
+  # invoke the function.
+  PrivateApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateRestApiId}/*/*"
+
+  # ── Silent-degradation signals ────────────────────────────────────────────
+  # Every fail-soft path below logs a warning, substitutes a fallback and returns
+  # success, so without these the degradation is invisible: the caller gets a 200
+  # containing quietly wrong data. Added after finding 49 unnoticed membership-
+  # lookup timeouts in forums over four days.
+  #
+  # PLAIN-TEXT filter patterns on purpose. get_logger() attaches the JSON
+  # formatter only to the logger it names (propagate=False), so modules using
+  # logging.getLogger(__name__) emit Lambda's default TEXT format. A JSON
+  # { $.message = ... } pattern matches nothing there; a quoted substring matches
+  # both formats.
+  #
+  # Explicit log group because Lambda only auto-creates it on first invocation,
+  # so a metric filter cannot attach on a fresh install without it. It also
+  # replaces an auto-created group that had NO retention policy at all.
+  FnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/certifications-${Stage}"
+      RetentionInDays: 30
+      KmsKeyId: !Ref LogsKmsKeyArn
+  AuthzDegradationsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # authorisation computed from stale or default data instead of live state
+      FilterPattern: '?"permission matrix load failed" ?"identity call failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/Certifications
+          MetricName: AuthzDegradations
+          MetricValue: '1'
+  AuthzDegradationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "authorisation computed from stale or default data instead of live state"
+      Namespace: Portal/Certifications
+      MetricName: AuthzDegradations
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: absent data means no calls were attempted, NOT that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA when idle.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+  LostDomainEventsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FnLogGroup
+      # a domain event was dropped after its write committed, so downstream projections diverge
+      FilterPattern: '?"event publish failed"'
+      MetricTransformations:
+        - MetricNamespace: Portal/Certifications
+          MetricName: LostDomainEvents
+          MetricValue: '1'
+  LostDomainEventsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "a domain event was dropped after its write committed, so downstream projections diverge"
+      Namespace: Portal/Certifications
+      MetricName: LostDomainEvents
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching: absent data means no calls were attempted, NOT that they
+      # succeeded. Without this the alarm sits in INSUFFICIENT_DATA when idle.
+      TreatMissingData: notBreaching
+      AlarmActions: [ !Ref OpsAlarmTopicArn ]
+
+Outputs:
+  FunctionArn: { Value: !GetAtt Fn.Arn }

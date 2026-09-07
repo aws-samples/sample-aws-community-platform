@@ -1,0 +1,74 @@
+[
+  {
+    "service": "identity-access",
+    "mode": "complete",
+    "implementedPaths": [
+      "*"
+    ],
+    "lastUpdated": "2026-07-31T00:00:00Z",
+    "pipelineRunId": "unit-2-codegen"
+  },
+  {
+    "service": "member-profiles",
+    "mode": "complete",
+    "implementedPaths": [
+      "*"
+    ],
+    "lastUpdated": "2026-08-02T00:00:00Z",
+    "pipelineRunId": "unit-3-codegen"
+  },
+  {
+    "service": "events",
+    "mode": "complete",
+    "implementedPaths": [
+      "*"
+    ],
+    "lastUpdated": "2026-08-05T00:00:00Z",
+    "pipelineRunId": "unit-4-codegen"
+  },
+  {
+    "service": "forums",
+    "mode": "complete",
+    "implementedPaths": [
+      "/forums"
+    ],
+    "lastUpdated": "2026-08-13T00:00:00Z",
+    "pipelineRunId": "unit-5-codegen"
+  },
+  {
+    "service": "certifications",
+    "mode": "complete",
+    "implementedPaths": [
+      "/certifications"
+    ],
+    "lastUpdated": "2026-08-06T00:00:00Z",
+    "pipelineRunId": "unit6-code-generation"
+  },
+  {
+    "service": "contributions-scoring",
+    "mode": "complete",
+    "implementedPaths": [
+      "/contributions"
+    ],
+    "lastUpdated": "2026-08-07T00:00:00Z",
+    "pipelineRunId": "unit-7-codegen"
+  },
+  {
+    "service": "announcements",
+    "mode": "complete",
+    "implementedPaths": [
+      "/announcements"
+    ],
+    "lastUpdated": "2026-08-07T00:00:00Z",
+    "pipelineRunId": "unit-9-codegen"
+  },
+  {
+    "service": "settings",
+    "mode": "complete",
+    "implementedPaths": [
+      "*"
+    ],
+    "lastUpdated": "2026-08-02T00:00:00Z",
+    "pipelineRunId": "unit-11-codegen"
+  }
+]
