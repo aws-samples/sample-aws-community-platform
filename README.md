@@ -246,7 +246,7 @@ Configuration is read from environment variables (all have defaults), not intera
 | `STAGE` | dev | Environment stage |
 | `ADMIN_EMAIL` | (dev default) | Receives the bootstrap admin invitation and OTP verification — set to a real mailbox |
 | `OPS_EMAIL` | (dev default) | Receives CloudWatch alarm notifications (SNS email subscription) |
-| `ALLOWED_DOMAINS` | amazon.com,cognizant.com | Comma-separated Cognito sign-up allow-list |
+| `ALLOWED_DOMAINS` | Comma-separated Cognito sign-up allow-list |
 | `BUCKET` | community-portal-artifacts-{account}-{region} | S3 artifact bucket |
 | `TEMPLATES_ONLY` | 0 | Stage and upload templates without deploying |
 
